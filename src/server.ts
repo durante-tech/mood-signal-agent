@@ -137,8 +137,8 @@ async function handleEvent(req: Request, opts: Required<HandlerOptions>): Promis
   const picked = pickModel(opts.env, opts.limiter);
 
   return sseStream(async (send) => {
-    // Set once the model has returned its final answer, so a failure after that
-    // point still says which model answered.
+    // Set once the model's final answer has passed the loop's checks, so a
+    // failure after that point still says which model answered.
     let modelAnswered = false;
     try {
       const result = await runAgent(event, {

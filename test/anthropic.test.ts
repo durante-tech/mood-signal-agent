@@ -9,7 +9,7 @@ import type { MoodEvent, TraceEntry } from "../src/types.ts";
 // one per request. No test here reaches the network.
 
 type Reply = { content: unknown[]; stop_reason: string };
-type Sent = { model: string; messages: Array<{ role: string; content: unknown }> };
+type Sent = { model: string; messages: Array<{ role: string; content: unknown }>; thinking?: unknown };
 let script: Reply[] = [];
 /** Every request body the stand-in received, oldest first. */
 let requests: Sent[] = [];
@@ -87,12 +87,23 @@ describe("AnthropicModel final answers", () => {
 });
 
 describe("parseRecommendation", () => {
-  const REJECTED = /must be a JSON object with non-empty "approach", "firstStep" and "rationale" strings/;
+  const REJECTED = /^the final answer must be exactly one JSON object whose only keys are "approach", "firstStep" and "rationale", each a non-empty string/;
   const WANT = { approach: "Check in today.", firstStep: "Message them.", rationale: "On call." };
   const OBJECT = JSON.stringify(WANT);
 
   test("prose with no JSON object is rejected", () => {
     expect(() => parseRecommendation("Offer a private check-in today.")).toThrow(REJECTED);
+  });
+
+  test("prose around a complete object is rejected", () => {
+    expect(() => parseRecommendation(`Here it is:\n${OBJECT}`)).toThrow(REJECTED);
+    expect(() => parseRecommendation(`${OBJECT}\nHope that helps.`)).toThrow(REJECTED);
+    expect(() => parseRecommendation(`I weighed {a few options}. ${OBJECT}`)).toThrow(REJECTED);
+    expect(() => parseRecommendation(`Sure.\n\`\`\`json\n${OBJECT}\n\`\`\``)).toThrow(REJECTED);
+  });
+
+  test("an object with an extra key is rejected", () => {
+    expect(() => parseRecommendation(JSON.stringify({ ...WANT, managerId: "e-006" }))).toThrow(/unexpected key\(s\): managerId/);
   });
 
   test("a JSON fragment is rejected, bare, after prose, or inside an unclosed fence", () => {
@@ -101,16 +112,21 @@ describe("parseRecommendation", () => {
     expect(() => parseRecommendation("```json\n" + FRAGMENT)).toThrow(REJECTED);
   });
 
+  test("two objects, an array, or a string are rejected", () => {
+    expect(() => parseRecommendation(`${OBJECT}\n${OBJECT}`)).toThrow(REJECTED);
+    expect(() => parseRecommendation(`[${OBJECT}]`)).toThrow(REJECTED);
+    expect(() => parseRecommendation(JSON.stringify(OBJECT))).toThrow(REJECTED);
+  });
+
   test("an object missing a field or carrying an empty one is rejected", () => {
     expect(() => parseRecommendation('{"approach":"Check in."}')).toThrow(REJECTED);
-    expect(() => parseRecommendation('Answer: {"approach":"Check in.","firstStep":"x"} done.')).toThrow(REJECTED);
     expect(() => parseRecommendation('{"approach":"","firstStep":"x","rationale":"y"}')).toThrow(REJECTED);
     expect(() => parseRecommendation('{"approach":"a","firstStep":"  ","rationale":"y"}')).toThrow(REJECTED);
   });
 
-  test("an object embedded in prose is found, even after other braces", () => {
-    expect(parseRecommendation(`I weighed {a few options}. Here it is:\n${OBJECT}\nHope that helps.`)).toEqual(WANT);
-    expect(parseRecommendation(`Sure.\n\`\`\`json\n${OBJECT}\n\`\`\``)).toEqual(WANT);
+  test("an exact object is accepted bare or in one json fence, with surrounding whitespace", () => {
+    expect(parseRecommendation(OBJECT)).toEqual(WANT);
+    expect(parseRecommendation(`  \n\`\`\`json\n${OBJECT}\n\`\`\`\n  `)).toEqual(WANT);
   });
 
   test("a brace inside a string value does not end the object", () => {
@@ -155,5 +171,52 @@ describe("AnthropicModel history replay", () => {
     await m.turn({ system: "s", messages: [user, marker, result("toolu_a"), result("toolu_a"), result("toolu_b")], tools: [] });
     expect(ids(requests[3]!.messages[1]!.content)).toEqual(["toolu_a", "toolu_b"]);
     expect(ids(requests[3]!.messages[2]!.content)).toEqual(["toolu_a", "toolu_b"]);
+  });
+
+  test("requests carry no thinking setting", async () => {
+    requests = [];
+    script = [FINAL];
+    await model().turn({ system: "s", messages: [user], tools: [] });
+    expect(requests.length).toBe(1);
+    expect("thinking" in requests[0]!).toBe(false);
+  });
+});
+
+describe("AnthropicModel in a full run", () => {
+  test("notify_manager is answered as queued in the replayed history, and one notification goes out after the final answer", async () => {
+    const store = seedStore();
+    const event: MoodEvent = { employeeId: "e-003", mood: "stressed", at: "2026-01-15T09:00:00.000Z" };
+    const lookups = [
+      { type: "text", text: "Looking both up.", citations: null },
+      { type: "tool_use", id: "toolu_e", name: "find_employee", input: { employeeId: "e-003" } },
+      { type: "tool_use", id: "toolu_m", name: "find_manager", input: { employeeId: "e-003" } },
+    ];
+    const notifyTurn = [{ type: "tool_use", id: "toolu_n", name: "notify_manager", input: { managerId: "e-002", subject: "s", body: "proposed" } }];
+    const answer = { approach: "Offer Priya a short check-in today.", firstStep: "Message her now.", rationale: "On call this week." };
+    requests = [];
+    script = [
+      { stop_reason: "tool_use", content: lookups },
+      { stop_reason: "tool_use", content: notifyTurn },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "```json\n" + JSON.stringify(answer) + "\n```", citations: null }] },
+    ];
+    const connection = await connectMemory(store);
+    try {
+      const result = await runAgent(event, { model: model(), connection });
+      expect(result.decision.action.recommendation).toEqual(answer);
+      expect(result.decision.action.notificationId).toBe(store.outbox[0]!.id);
+    } finally {
+      await connection.close();
+    }
+
+    expect(store.outbox.length).toBe(1);
+    expect(store.outbox[0]!.body).not.toContain("proposed");
+    // The last request replays both recorded turns as they came, each followed by its results.
+    const sent = requests[2]!.messages;
+    expect(sent[1]).toEqual({ role: "assistant", content: lookups });
+    expect(sent[3]).toEqual({ role: "assistant", content: notifyTurn });
+    const queued = (sent[4]!.content as Array<{ tool_use_id: string; content: string; is_error: boolean }>)[0]!;
+    expect(queued.tool_use_id).toBe("toolu_n");
+    expect(queued.is_error).toBe(false);
+    expect(JSON.parse(queued.content)).toMatchObject({ status: "queued", managerId: "e-002" });
   });
 });

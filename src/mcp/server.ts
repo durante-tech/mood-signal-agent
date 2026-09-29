@@ -18,11 +18,18 @@ function fail(message: string): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
 }
 
+/**
+ * The highest number among outbox ids of the form "n-<1 to 15 digits>". Other
+ * ids are ignored. Fifteen digits stay below 2^53, so the number is exact and
+ * the next id is always new; a longer suffix is never converted.
+ */
 function highestNotificationNumber(outbox: Notification[]): number {
   let highest = 0;
   for (const n of outbox) {
-    const match = /^n-(\d+)$/.exec(n.id);
-    if (match) highest = Math.max(highest, Number(match[1]));
+    const match = /^n-(\d{1,15})$/.exec(n.id);
+    if (!match?.[1]) continue;
+    const value = Number.parseInt(match[1], 10);
+    if (value > highest) highest = value;
   }
   return highest;
 }

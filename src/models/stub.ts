@@ -4,6 +4,9 @@
  * tool results back out of the transcript:
  *   turn 1 -> find_employee, turn 2 -> find_manager, turn 3 -> notify_manager,
  *   turn 4 -> final recommendation.
+ * The loop answers the notify_manager call as queued and never sends the body
+ * proposed here; it sends one notification itself after the final answer, which
+ * is an object with exactly the three recommendation fields.
  * If a tool result is an error it stops early and finishes with what it has.
  */
 import type { Employee, Model, ModelMessage, ModelTurn, Recommendation, ToolSpec } from "../types.ts";
@@ -75,6 +78,7 @@ function facts(e: Employee): string {
   return e.notes.length > 0 ? e.notes.join(" ") : "No notes on file.";
 }
 
+/** The body the stub proposes to notify_manager. The loop does not send it. */
 function notificationBody(employee: Employee, manager: Employee): string {
   return [
     `Hi ${firstName(manager)},`,

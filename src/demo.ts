@@ -7,7 +7,7 @@
  * Without --live it uses the deterministic stub model and needs no key.
  * With --live it calls Claude and needs ANTHROPIC_API_KEY.
  */
-import { runAgent } from "./agent/run.ts";
+import { isQueuedAnswer, runAgent } from "./agent/run.ts";
 import { connectStdio } from "./mcp/connect.ts";
 import { AnthropicModel } from "./models/anthropic.ts";
 import { StubModel } from "./models/stub.ts";
@@ -33,7 +33,7 @@ export function formatEntry(e: TraceEntry): string {
     case "tool_call":
       return `[tool_call] ${e.name} ${JSON.stringify(e.args)}`;
     case "tool_result":
-      return `[tool_result] ${e.name}${e.isError ? " ERROR" : ""} ${JSON.stringify(e.result)}`;
+      return `[tool_result] ${e.name}${e.isError ? " ERROR" : isQueuedAnswer(e.result) ? " QUEUED" : ""} ${JSON.stringify(e.result)}`;
     case "model":
       return `[model] ${e.model}: ${e.recommendation.firstStep}`;
     case "notification":

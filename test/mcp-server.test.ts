@@ -127,6 +127,21 @@ describe("MCP tools over an in-memory transport", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  test("notify_manager ignores outbox ids whose number is longer than 15 digits", async () => {
+    // Converted whole, the 400-digit id is Infinity and the 20-digit one loses precision.
+    const store = seedStore();
+    const earlier = { toEmployeeId: "e-002", subject: "earlier", body: "earlier", sentAt: "2026-01-01T00:00:00.000Z" };
+    store.outbox.push(
+      { id: `n-${"9".repeat(400)}`, ...earlier },
+      { id: "n-12345678901234567890", ...earlier },
+      { id: "n-2", ...earlier },
+    );
+    const conn = await connectMemory(store);
+    close = conn.close;
+    await conn.client.callTool({ name: "notify_manager", arguments: { managerId: "e-002", subject: "s", body: "b" } });
+    expect(store.outbox.at(-1)!.id).toBe("n-3");
+  });
+
   test("notify_manager rejects an unknown manager and sends nothing", async () => {
     const { client, store } = await open();
     const r = read(

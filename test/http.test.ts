@@ -137,7 +137,8 @@ describe("HTTP server", () => {
     const last = blocks.at(-1)!;
     expect(isDone(last)).toBe(true);
     expect(last.data).toMatchObject({ answeredBy: "stub", live: false });
-    expect((last.data as { error?: string }).error).toMatch(/find_manager failed for e-001/);
+    expect((last.data as { error?: string }).error).toMatch(/^employee e-001 has no manager/);
+    expect(traceEntries(blocks).some((e) => e.kind === "notification")).toBe(false);
   }, 15_000);
 
   test("GET / serves the page", async () => {
@@ -169,6 +170,9 @@ describe("HTTP server", () => {
     const calls = entries.filter((e) => e.kind === "tool_call").map((e) => e.name);
     expect(calls).toEqual(["find_employee", "find_manager", "notify_manager"]);
     expect(entries.some((e) => e.kind === "error")).toBe(false);
+    const order = entries.map((e) => e.kind);
+    expect(order.filter((k) => k === "notification").length).toBe(1);
+    expect(order.indexOf("notification")).toBeGreaterThan(order.indexOf("model"));
   }, 15_000);
 
   test("POST /api/event with another mood runs no agent", async () => {

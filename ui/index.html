@@ -179,12 +179,24 @@
   function markStep(name, detail, failed) {
     const li = steps.querySelector(`[data-step="${name}"]`);
     if (!li) return;
-    // The latest result wins: a refused notify followed by a sent one reads as sent.
     li.classList.remove("on", "fail");
     li.classList.add(failed ? "fail" : "on");
     li.querySelector(".detail").textContent = detail || "";
   }
-  const STEP_FOR_TOOL = { find_employee: "employee", find_manager: "manager", notify_manager: "notify" };
+  // Only the lookups mark a step from a tool result. "Manager notified" turns
+  // green on the loop's notification entry and on nothing else.
+  const STEP_FOR_TOOL = { find_employee: "employee", find_manager: "manager" };
+  function isQueued(entry) {
+    return entry.name === "notify_manager" && !entry.isError && (entry.result || {}).status === "queued";
+  }
+  function noteQueued(managerId) {
+    const li = steps.querySelector('[data-step="notify"]');
+    if (li && !li.classList.contains("on")) li.querySelector(".detail").textContent = `queued for ${managerId}`;
+  }
+  function markNotSent() {
+    const li = steps.querySelector('[data-step="notify"]');
+    if (li && !li.classList.contains("on")) markStep("notify", "not sent", true);
+  }
 
   // --- one renderer per trace entry kind ---
   function render(entry) {
@@ -196,12 +208,20 @@
         break;
       }
       case "tool_call":
-        addRow("tool_call", `Calling ${entry.name}`, pre(entry.args), { at: entry.at });
+        addRow("tool_call", entry.name === "notify_manager"
+          ? "The model asks to notify the manager"
+          : `Calling ${entry.name}`, pre(entry.args), { at: entry.at });
         break;
       case "tool_result": {
-        const step = STEP_FOR_TOOL[entry.name];
         const r = entry.result || {};
-        if (step) markStep(step, entry.isError ? "error" : (r.name || r.subject || r.id || ""), entry.isError);
+        if (isQueued(entry)) {
+          noteQueued(r.managerId);
+          addRow("queued", `notify_manager queued for ${r.managerId}; the loop sends once, after the final answer`,
+            pre(entry.result), { at: entry.at });
+          break;
+        }
+        const step = STEP_FOR_TOOL[entry.name];
+        if (step) markStep(step, entry.isError ? "error" : (r.name || r.id || ""), entry.isError);
         addRow("tool_result", `${entry.name} ${entry.isError ? "returned an error" : "returned"}`,
           pre(entry.result), { at: entry.at, error: entry.isError });
         break;
@@ -230,6 +250,7 @@
         break;
       }
       case "error":
+        markNotSent();
         addRow("error", entry.message || "Unknown error", null, { at: entry.at, error: true });
         break;
       default:
@@ -244,7 +265,7 @@
         ? `${s.answeredBy} answered, then the run failed (${kind})`
         : `${s.answeredBy} (${kind})`
       : s.error
-        ? "the run failed before a model answered"
+        ? "the run failed before a model gave a valid answer"
         : "no agent ran";
     const pairs = [["Answered by", who], ["Why", s.reason], ["Store", s.store]];
     if (s.error) pairs.push(["Error", s.error]);

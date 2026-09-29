@@ -5,13 +5,17 @@
  * Messages API shape on every turn. The API requires each `tool_result` block
  * to answer a `tool_use` block from the assistant turn right before it, so the
  * class remembers the assistant content it received for every tool-calling
- * turn and sends it back unchanged (thinking blocks included), keyed by the
- * tool_use ids. That keeps the history append-only. A recorded turn is only
- * replayed when its tool_use blocks and the results that follow match one to
- * one; otherwise the turn is rebuilt from the recorded calls.
+ * turn and sends it back unchanged, keyed by the tool_use ids. That keeps the
+ * history append-only. A recorded turn is replayed when its tool_use blocks
+ * and the results that follow match one to one, which is the normal case;
+ * otherwise the turn is rebuilt from the recorded calls. Extended thinking is
+ * off, so a rebuilt turn, which carries only tool_use blocks, is a valid turn.
  */
 import Anthropic from "@anthropic-ai/sdk";
-import type { Model, ModelMessage, ModelTurn, Recommendation, ToolSpec } from "../types.ts";
+import { parseRecommendation } from "../recommendation.ts";
+import type { Model, ModelMessage, ModelTurn, ToolSpec } from "../types.ts";
+
+export { parseRecommendation };
 
 export const LIVE_MODEL_ID = "claude-sonnet-5-5";
 
@@ -40,9 +44,6 @@ export class AnthropicModel implements Model {
       messages: this.toApiMessages(input.messages),
       tools: input.tools.map(toApiTool),
       tool_choice: { type: "auto" },
-      // Sonnet 5.5's lowest thinking setting: no extended thinking, so the small
-      // max_tokens goes to the answer. Other models reject this value.
-      ...(this.name === LIVE_MODEL_ID ? { thinking: { type: "between_tools" as const } } : {}),
     });
 
     if (response.stop_reason === "refusal") {
@@ -122,8 +123,7 @@ export class AnthropicModel implements Model {
    * exactly one result here and no result answers anything else. When that
    * does not hold, the turn is rebuilt from the recorded calls: one tool_use
    * per answered id, each answered once, so the API never sees an unanswered
-   * or doubly answered tool_use. A rebuilt turn carries no text or thinking
-   * blocks.
+   * or doubly answered tool_use. A rebuilt turn carries no text blocks.
    */
   private pairTurn(
     turn: number | undefined,
@@ -165,64 +165,6 @@ function toApiTool(spec: ToolSpec): Anthropic.Tool {
     description: spec.description,
     input_schema: { ...schema, type: "object" },
   };
-}
-
-/**
- * Reads {approach, firstStep, rationale} from the model's final text. The
- * object may stand alone, sit in a fenced block, or be surrounded by prose:
- * every balanced {...} in the text is tried in order, and the first one that
- * parses with all three fields as non-empty strings is the answer. Anything
- * else is an error, because a manager should never receive prose nobody
- * checked or half of a JSON object.
- */
-export function parseRecommendation(text: string): Recommendation {
-  let sawObject = false;
-  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
-    const end = closingBrace(text, start);
-    if (end === -1) continue;
-    const value = parseJson(text.slice(start, end + 1));
-    if (!isRecord(value)) continue;
-    sawObject = true;
-    const { approach, firstStep, rationale } = value;
-    if (isFilled(approach) && isFilled(firstStep) && isFilled(rationale)) return { approach, firstStep, rationale };
-  }
-  const found = sawObject ? "no JSON object in it had all three" : "no complete JSON object was found in it";
-  throw new Error(
-    `the model's final answer must be a JSON object with non-empty "approach", "firstStep" and "rationale" strings; ${found}`,
-  );
-}
-
-/** Index of the brace that closes the one at `start`, skipping braces inside strings; -1 if none. */
-function closingBrace(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
-    const c = text[i];
-    if (inString) {
-      if (c === "\\") i += 1;
-      else if (c === '"') inString = false;
-    } else if (c === '"') {
-      inString = true;
-    } else if (c === "{") {
-      depth += 1;
-    } else if (c === "}") {
-      depth -= 1;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
-}
-
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
-
-function isFilled(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -2,17 +2,30 @@
  * The agent loop. One mood event in, one Decision out, with a trace entry for
  * every step so a UI can show the work as it happens.
  *
- * The loop, not the model, decides whether a notification goes out. A
- * notify_manager call runs only when it is addressed to the manager that
- * find_manager returned for the event's own employee, and only once per run.
- * Any other notify_manager call is refused with an error result the model can
- * read, and nothing is sent. If the model finishes without a notification, the
- * loop looks up the event's employee and manager itself and sends one.
+ * The model decides; the loop sends. The model's notify_manager call is its
+ * decision that the manager should be told. The loop does not execute it: it
+ * answers with a "queued" result naming the manager the loop confirmed for the
+ * event's own employee, and ignores the subject and body the model proposed.
+ * A second such call gets the same answer.
+ *
+ * The one notification goes out at the end of the run, and only when all of
+ * this holds:
+ *   - the model's final answer passes `toRecommendation`;
+ *   - the loop has confirmed the event's employee and their manager, with
+ *     find_employee and find_manager called on `event.employeeId` (by the model
+ *     or, if it did not, by the loop);
+ *   - the answer's approach and first step name no other employee the run
+ *     looked up.
+ * Its body is built by the loop from the approach, the first step and the
+ * confirmed employee's name. If any check fails, nothing is sent and the run
+ * ends in an error entry. An employee with no manager ends the run the same
+ * way, as soon as the loop learns it.
  *
  * The caller owns the MCP connection: runAgent uses it and never closes it.
  */
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { toolSpecs } from "../mcp/connect.ts";
+import { toRecommendation } from "../recommendation.ts";
 import type {
   Decision,
   Employee,
@@ -27,6 +40,14 @@ import type {
 import { SYSTEM_PROMPT, userMessage } from "./prompt.ts";
 
 const MAX_TURNS = 8;
+
+/** The status the loop puts in its answer to the model's notify_manager call. */
+export const QUEUED = "queued";
+
+/** True for the loop's answer to a notify_manager call. */
+export function isQueuedAnswer(result: unknown): boolean {
+  return isRecord(result) && result.status === QUEUED;
+}
 
 export async function runAgent(
   event: MoodEvent,
@@ -45,75 +66,92 @@ export async function runAgent(
   };
   const { client } = opts.connection;
 
-  // What the loop has confirmed about the event's own employee. Lookups of
-  // anyone else go back to the model but are never used for the notification.
+  // What lookups for the event's own employee returned. Lookups of anyone else
+  // go back to the model and are never used for the notification.
   let employee: Employee | undefined;
   let manager: Employee | undefined;
-  // The one notification this run sent. It is the only id a Decision may carry.
-  let notification: Notification | undefined;
+  // Every employee record any lookup returned, by id, for the name check.
+  const seen = new Map<string, Employee>();
   // Tool errors keyed by tool name and arguments: the same failing call is not
   // repeated, while the same tool with other arguments still runs.
   const failures = new Map<string, string>();
+  // Set once the loop has confirmed who is notified; reused by every later call.
+  let confirmed: { employee: Employee; manager: Employee } | undefined;
 
-  /** Why a notify_manager call must not run, or undefined when it may. */
-  const refusal = (args: Record<string, unknown>): string | undefined => {
-    if (notification) {
-      return `Not sent: already notified, ${notification.id}. A run sends one notification.`;
-    }
-    if (!manager || args.managerId !== manager.id) {
-      return (
-        `Not sent: the recipient must be the manager of employee ${event.employeeId}. ` +
-        `Call find_manager with employeeId "${event.employeeId}" first and address notify_manager to the id it returns.`
-      );
-    }
-    return undefined;
-  };
-
-  /** Calls one tool, records the trace, and remembers what it confirmed. */
-  const invoke = async (name: string, args: Record<string, unknown>) => {
-    emit({ kind: "tool_call", at: now(), name, args });
-    const refused = name === "notify_manager" ? refusal(args) : undefined;
-    if (refused) {
-      const result = { error: refused };
-      emit({ kind: "tool_result", at: now(), name, result, isError: true });
-      return { result: result as unknown, isError: true };
-    }
-
+  /** Runs one lookup tool, records the trace, and remembers what it returned. */
+  const lookup = async (name: string, args: Record<string, unknown>) => {
     const { result, isError } = await callTool(client, name, args);
     emit({ kind: "tool_result", at: now(), name, result, isError });
     if (isError) {
       failures.set(callKey(name, args), describe(result));
       return { result, isError };
     }
-
-    const forEvent = args.employeeId === event.employeeId;
-    if (name === "find_employee" && forEvent) {
-      const found = asEmployee(result);
-      if (found?.id === event.employeeId) employee = found;
-    }
-    if (name === "find_manager" && forEvent) manager = asEmployee(result) ?? manager;
-    if (name === "notify_manager") {
-      const sent = asNotification(result);
-      // The tool says it sent something; without an id there is nothing to
-      // record, and sending again could reach the manager twice.
-      if (!sent) throw new Error(`notify_manager reported success but returned no notification: ${describe(result)}`);
-      notification = sent;
-      emit({ kind: "notification", at: now(), notification: sent });
+    const found = asEmployee(result);
+    if (found) seen.set(found.id, found);
+    if (found && args.employeeId === event.employeeId) {
+      if (name === "find_employee" && found.id === event.employeeId) employee = found;
+      if (name === "find_manager") manager = found;
     }
     return { result, isError };
+  };
+
+  /** The loop's own lookup on the event's employee, unless the same call already failed. */
+  const need = async (name: "find_employee" | "find_manager"): Promise<Employee> => {
+    const args = { employeeId: event.employeeId };
+    const known = failures.get(callKey(name, args));
+    if (known !== undefined) throw new Error(`${name} failed for ${event.employeeId}: ${known}; nothing was sent`);
+    emit({ kind: "tool_call", at: now(), name, args });
+    const { result, isError } = await lookup(name, args);
+    if (isError) throw new Error(`${name} failed for ${event.employeeId}: ${describe(result)}; nothing was sent`);
+    const found = name === "find_employee" ? employee : manager;
+    if (!found) throw new Error(`${name} returned no employee record for ${event.employeeId}: ${describe(result)}`);
+    return found;
+  };
+
+  /** The event's employee and their manager, looked up by the loop where the model did not. */
+  const confirm = async (): Promise<{ employee: Employee; manager: Employee }> => {
+    if (confirmed) return confirmed;
+    const who = employee ?? (await need("find_employee"));
+    if (who.managerId === null) {
+      throw new Error(`employee ${event.employeeId} has no manager, so there is nobody to notify; nothing was sent`);
+    }
+    const boss = manager ?? (await need("find_manager"));
+    if (boss.id !== who.managerId) {
+      throw new Error(
+        `find_manager returned ${boss.id} for ${event.employeeId}, but their record names ${who.managerId}; nothing was sent`,
+      );
+    }
+    confirmed = { employee: who, manager: boss };
+    return confirmed;
+  };
+
+  /** One model tool call: notify_manager is queued, anything else runs. */
+  const invoke = async (name: string, args: Record<string, unknown>) => {
+    emit({ kind: "tool_call", at: now(), name, args });
+    if (name !== "notify_manager") return lookup(name, args);
+    const { manager: boss } = await confirm();
+    const result = {
+      status: QUEUED,
+      managerId: boss.id,
+      message:
+        `Not sent yet. One notification to manager ${boss.id} is queued and will be sent after your final answer, ` +
+        `built from its approach and first step. The subject and body you proposed are not used. ` +
+        `Finish with the JSON answer.`,
+    };
+    emit({ kind: "tool_result", at: now(), name, result, isError: false });
+    return { result: result as unknown, isError: false };
   };
 
   emit({ kind: "event", at: now(), event });
   try {
     const tools = await toolSpecs(client);
     const messages: ModelMessage[] = [{ role: "user", content: userMessage(event) }];
-    let recommendation: Recommendation | undefined;
+    let answer: Recommendation | undefined;
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
       const out = await opts.model.turn({ system: SYSTEM_PROMPT, messages, tools });
       if (out.kind === "final") {
-        recommendation = out.recommendation;
-        emit({ kind: "model", at: now(), model: opts.model.name, recommendation });
+        answer = out.recommendation;
         break;
       }
       if (out.calls.length === 0) throw new Error("the model returned neither tool calls nor a final answer");
@@ -123,31 +161,26 @@ export async function runAgent(
         messages.push({ role: "tool_result", content: JSON.stringify(result), toolCallId: call.id, isError });
       }
     }
-    if (!recommendation) throw new Error(`the model did not finish within ${MAX_TURNS} turns`);
+    if (!answer) throw new Error(`the model did not finish within ${MAX_TURNS} turns`);
 
-    // The manager is always notified: if the model did not do it, the loop
-    // does, using the event's own employee id and never anyone the model chose.
-    if (!notification) {
-      const need = async (name: "find_employee" | "find_manager"): Promise<Employee> => {
-        const args = { employeeId: event.employeeId };
-        const known = failures.get(callKey(name, args));
-        if (known !== undefined) throw new Error(`${name} failed for ${event.employeeId}: ${known}`);
-        const { result, isError } = await invoke(name, args);
-        if (isError) throw new Error(`${name} failed for ${event.employeeId}: ${describe(result)}`);
-        const found = name === "find_employee" ? employee : manager;
-        if (!found) throw new Error(`${name} returned no employee record for ${event.employeeId}: ${describe(result)}`);
-        return found;
-      };
-      const who = employee ?? (await need("find_employee"));
-      const boss = manager ?? (await need("find_manager"));
-      const sent = await invoke("notify_manager", {
-        managerId: boss.id,
-        subject: `Check in with ${who.name}`,
-        body: recommendation.approach,
-      });
-      if (sent.isError) throw new Error(`notify_manager failed: ${describe(sent.result)}`);
+    let recommendation: Recommendation;
+    try {
+      recommendation = toRecommendation(answer);
+    } catch (err) {
+      throw new Error(`${err instanceof Error ? err.message : String(err)}; nothing was sent`);
     }
-    if (!notification) throw new Error("notify_manager returned no notification");
+    emit({ kind: "model", at: now(), model: opts.model.name, recommendation });
+
+    const { employee: who, manager: boss } = await confirm();
+    const stranger = otherEmployeeNamed(recommendation, [...seen.values()], [who, boss]);
+    if (stranger) {
+      throw new Error(
+        `the final answer names ${stranger.name} (${stranger.id}), who is not ${who.name}, the employee in this event; nothing was sent`,
+      );
+    }
+
+    const notification = await send(client, boss, who, recommendation);
+    emit({ kind: "notification", at: now(), notification });
 
     const decision: Decision = {
       id: `d-${crypto.randomUUID().slice(0, 8)}`,
@@ -164,6 +197,54 @@ export async function runAgent(
     emit({ kind: "error", at: now(), message });
     throw err instanceof Error ? err : new Error(message);
   }
+}
+
+/** The one send of a run: the loop's own notify_manager call, built from the checked answer. */
+async function send(client: Client, manager: Employee, employee: Employee, rec: Recommendation): Promise<Notification> {
+  const args = {
+    managerId: manager.id,
+    subject: `Check in with ${employee.name}`,
+    body: [
+      `${employee.name} clicked "stressed" on the team mood meter.`,
+      "",
+      `Approach: ${rec.approach}`,
+      "",
+      `First step: ${rec.firstStep}`,
+    ].join("\n"),
+  };
+  const { result, isError } = await callTool(client, "notify_manager", args);
+  if (isError) throw new Error(`notify_manager failed: ${describe(result)}`);
+  const sent = asNotification(result);
+  if (!sent || sent.toEmployeeId !== manager.id) {
+    throw new Error(`notify_manager returned no notification for ${manager.id}: ${describe(result)}`);
+  }
+  return sent;
+}
+
+/**
+ * The first looked-up employee, other than `allowed`, whose full name or first
+ * name appears as a whole word in the approach or first step. A first name
+ * shared with an allowed person is not checked.
+ */
+function otherEmployeeNamed(rec: Recommendation, seen: Employee[], allowed: Employee[]): Employee | undefined {
+  const allowedIds = new Set(allowed.map((e) => e.id));
+  const allowedNames = new Set(allowed.flatMap((e) => [e.name, firstName(e)]));
+  const text = `${rec.approach}\n${rec.firstStep}`;
+  for (const other of seen) {
+    if (allowedIds.has(other.id)) continue;
+    const names = [other.name, firstName(other)].filter((n) => n.length > 0 && !allowedNames.has(n));
+    if (names.some((n) => containsWord(text, n))) return other;
+  }
+  return undefined;
+}
+
+function firstName(e: Employee): string {
+  return e.name.trim().split(/\s+/)[0] ?? "";
+}
+
+function containsWord(text: string, word: string): boolean {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "u").test(text);
 }
 
 /**
@@ -206,8 +287,14 @@ function canonical(value: unknown): string {
   return JSON.stringify(value) ?? "undefined";
 }
 
+/** An employee record: string id and name, and a managerId that is a string or null. */
 function asEmployee(value: unknown): Employee | undefined {
-  if (isRecord(value) && typeof value.id === "string" && typeof value.name === "string") {
+  if (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    (value.managerId === null || typeof value.managerId === "string")
+  ) {
     return value as unknown as Employee;
   }
   return undefined;
