@@ -129,6 +129,17 @@ describe("AnthropicModel requests", () => {
     expect(turn).toEqual({ kind: "final", recommendation: { approach: "a", firstStep: "b", rationale: "c" } });
     expect(requests.length).toBe(3);
   });
+
+  test("usage sums every answered request's usage block", async () => {
+    requests = [];
+    script = [final(), final()];
+    const m = model();
+    expect(m.usage).toEqual({ requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
+    await m.turn({ system: "s", messages: [{ role: "user", content: "u" }], tools: [] });
+    await m.turn({ system: "s", messages: [{ role: "user", content: "u" }], tools: [] });
+    // The mock answers every request with usage { input_tokens: 10, output_tokens: 10 }.
+    expect(m.usage).toEqual({ requests: 2, inputTokens: 20, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 });
+  });
 });
 
 describe("parseRecommendation", () => {

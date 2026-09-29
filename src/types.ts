@@ -100,6 +100,17 @@ export interface Model {
   readonly name: string;
   /** One turn: given the transcript and the tools, decide to call tools or finish. */
   turn(input: { system: string; messages: ModelMessage[]; tools: ToolSpec[] }): Promise<ModelTurn>;
+  /** Tokens spent so far by this model instance, when the model reports them. Absent on the stub. */
+  readonly usage?: ModelUsage;
+}
+
+/** What a live model reported spending, summed over the requests of one instance. */
+export interface ModelUsage {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
 }
 
 /** The in-process record of what the agent did for one event. */

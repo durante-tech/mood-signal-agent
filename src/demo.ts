@@ -63,6 +63,7 @@ async function main(): Promise<number> {
       onTrace: (e) => console.log(formatEntry(e)),
     });
     console.log(`answered by: ${result.answeredBy}`);
+    if (model.usage) console.log(`model usage: ${JSON.stringify(model.usage)}`);
     console.log(JSON.stringify(result.decision, null, 2));
     return 0;
   } catch {

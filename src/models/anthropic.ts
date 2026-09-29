@@ -17,7 +17,7 @@
  */
 import Anthropic from "@anthropic-ai/sdk";
 import { parseRecommendation } from "../recommendation.ts";
-import type { Model, ModelMessage, ModelTurn, ToolSpec } from "../types.ts";
+import type { Model, ModelMessage, ModelTurn, ModelUsage, ToolSpec } from "../types.ts";
 
 export { parseRecommendation };
 
@@ -37,10 +37,22 @@ export class AnthropicModel implements Model {
   /** The assistant content of each tool-calling turn, as the API returned it. */
   private readonly turns: Anthropic.ContentBlockParam[][] = [];
 
+  /** Summed from every response's `usage` block, so a run can report what it spent. */
+  readonly usage: ModelUsage = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+
   constructor(apiKey: string, opts: { model?: string; maxTokens?: number } = {}) {
     this.name = opts.model ?? LIVE_MODEL_ID;
     this.maxTokens = opts.maxTokens ?? 600;
     this.client = new Anthropic({ apiKey, maxRetries: MAX_RETRIES });
+  }
+
+  private record(usage: Anthropic.Usage | undefined): void {
+    this.usage.requests += 1;
+    if (!usage) return;
+    this.usage.inputTokens += usage.input_tokens ?? 0;
+    this.usage.outputTokens += usage.output_tokens ?? 0;
+    this.usage.cacheReadTokens += usage.cache_read_input_tokens ?? 0;
+    this.usage.cacheWriteTokens += usage.cache_creation_input_tokens ?? 0;
   }
 
   async turn(input: { system: string; messages: ModelMessage[]; tools: ToolSpec[] }): Promise<ModelTurn> {
@@ -56,6 +68,7 @@ export class AnthropicModel implements Model {
       tools: input.tools.map(toApiTool),
       tool_choice: { type: "auto" },
     });
+    this.record(response.usage);
 
     if (response.stop_reason === "refusal") {
       const category = response.stop_details?.category ?? "unspecified";

@@ -18,7 +18,7 @@ import { connectMemory } from "./mcp/connect.ts";
 import { seedStore } from "./mcp/data.ts";
 import { pickModel } from "./models/pick.ts";
 import { RollingLimiter } from "./ratelimit.ts";
-import type { Mood, MoodEvent, TraceEntry } from "./types.ts";
+import type { ModelUsage, Mood, MoodEvent, TraceEntry } from "./types.ts";
 
 const MOODS: readonly Mood[] = ["great", "good", "okay", "low", "stressed"];
 const UI_PATH = join(import.meta.dir, "..", "ui", "index.html");
@@ -30,6 +30,8 @@ export interface DoneSummary {
   live: boolean;
   reason: string;
   store: string;
+  /** What the live model reported spending on this run; null on the stub. */
+  usage: ModelUsage | null;
   error?: string;
 }
 
@@ -126,6 +128,7 @@ async function handleEvent(req: Request, opts: Required<HandlerOptions>): Promis
         live: false,
         reason: `mood "${event.mood}" does not trigger the agent; only "stressed" does, so no agent ran`,
         store: STORE_NOTE,
+        usage: null,
       };
       send(done, "done");
     });
@@ -154,6 +157,7 @@ async function handleEvent(req: Request, opts: Required<HandlerOptions>): Promis
         live: picked.live,
         reason: picked.reason,
         store: STORE_NOTE,
+        usage: picked.model.usage ?? null,
       };
       send(done, "done");
     } catch (err) {
@@ -163,6 +167,7 @@ async function handleEvent(req: Request, opts: Required<HandlerOptions>): Promis
         live: picked.live,
         reason: picked.reason,
         store: STORE_NOTE,
+        usage: picked.model.usage ?? null,
         error: err instanceof Error ? err.message : String(err),
       };
       send(done, "done");

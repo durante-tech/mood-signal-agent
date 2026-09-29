@@ -282,6 +282,10 @@
         ? "the run failed before a model gave a valid answer"
         : "no agent ran";
     const pairs = [["Answered by", who], ["Why", s.reason], ["Store", s.store]];
+    if (s.usage) {
+      const u = s.usage;
+      pairs.push(["Model usage", `${u.requests} requests, ${u.inputTokens} input tokens, ${u.outputTokens} output tokens, ${u.cacheReadTokens} cache read, ${u.cacheWriteTokens} cache write`]);
+    }
     if (s.error) pairs.push(["Error", s.error]);
     addRow("done", s.error ? "Run failed" : "Run finished", fields(pairs), { summary: true, error: Boolean(s.error) });
   }
