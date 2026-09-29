@@ -1,6 +1,6 @@
 # How this was built and checked
 
-This repository was built in one afternoon (2026-09-29) by a fleet of AI agents under one orchestrating session, against a written statement of what "done" means. Each claim below was stated before the code existed, names the check that would prove it false, and was closed only on the output of that check, re-run by the orchestrator itself after the agents reported. The record behind this page (the full statement, the agents' returns, the review rounds, the screenshots and the cost measurement) is kept with the build; this page is the public-safe rendering of it.
+This repository was built on 2026-09-29 by a fleet of AI agents under one orchestrating session, against a written statement of what "done" means. Each claim below was stated before the code existed, names the check that would prove it false, and was closed only on the output of that check, re-run by the orchestrator itself after the agents reported. The record behind this page (the full statement, the agents' returns, the review rounds, the screenshots and the cost measurement) is kept with the build; this page is the public-safe rendering of it.
 
 ## What the build was asked for, verbatim
 
