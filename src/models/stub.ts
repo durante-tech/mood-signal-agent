@@ -53,8 +53,18 @@ function call(step: number, name: string, args: Record<string, unknown>): ModelT
 function findEmployeeId(messages: ModelMessage[]): string {
   for (const m of messages) {
     if (m.role !== "user") continue;
-    const match = /"employeeId":"([^"]+)"/.exec(m.content);
-    if (match?.[1]) return match[1];
+    // The event line is JSON written by JSON.stringify, so it is read back by JSON.parse:
+    // a regex over the text would split an id that JSON escapes (a quote, a backslash).
+    for (const line of m.content.split("\n")) {
+      const start = line.indexOf("{");
+      if (start < 0) continue;
+      try {
+        const parsed = JSON.parse(line.slice(start)) as { employeeId?: unknown };
+        if (typeof parsed.employeeId === "string" && parsed.employeeId) return parsed.employeeId;
+      } catch {
+        // not the event line
+      }
+    }
   }
   return "";
 }
