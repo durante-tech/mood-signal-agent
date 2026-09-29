@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mood signal agent</title>
+<style>
+  :root {
+    --accent: #0f766e;
+    --accent-soft: #e6f4f2;
+    --ink: #1f2328;
+    --muted: #656d76;
+    --line: #d8dee4;
+    --bg: #f6f8fa;
+    --card: #ffffff;
+    --error: #b42318;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 20px 64px; }
+  header h1 { margin: 0 0 6px; font-size: 24px; }
+  header p { margin: 0; color: var(--muted); max-width: 70ch; }
+  #status { margin-top: 10px; font-size: 13px; color: var(--muted); }
+  #status b { color: var(--ink); font-weight: 600; }
+
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 20px;
+    margin-top: 20px;
+  }
+  .panel h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; margin-right: 6px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-size: 12px;
+  }
+
+  .controls { display: grid; grid-template-columns: 1fr 1.4fr; gap: 20px; }
+  @media (max-width: 720px) { .controls { grid-template-columns: 1fr; } }
+  select {
+    width: 100%; padding: 9px 10px; font: inherit;
+    border: 1px solid var(--line); border-radius: 8px; background: #fff;
+  }
+  .moods { display: flex; flex-wrap: wrap; gap: 8px; }
+  .moods button {
+    font: inherit; padding: 8px 14px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--ink);
+  }
+  .moods button:hover:not(:disabled) { border-color: var(--accent); }
+  .moods button.stressed { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .moods button:disabled { opacity: .5; cursor: default; }
+  .hint { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
+
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; list-style: none; margin: 0; padding: 0; }
+  @media (max-width: 720px) { .steps { grid-template-columns: repeat(2, 1fr); } }
+  .steps li {
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    color: var(--muted); font-size: 14px;
+  }
+  .steps li .detail { display: block; font-size: 12px; min-height: 18px; }
+  .steps li.on { border-color: var(--accent); background: var(--accent-soft); color: var(--ink); }
+  .steps li.on .num { background: var(--accent); }
+  .steps li:not(.on) .num { background: var(--line); color: var(--muted); }
+  .steps li.fail { border-color: var(--error); color: var(--error); }
+
+  #trace { list-style: none; margin: 16px 0 0; padding: 0; }
+  #trace:empty::before { content: "Nothing yet. Pick an employee and click a mood."; color: var(--muted); font-size: 14px; }
+  #trace li { border-top: 1px solid var(--line); padding: 10px 0; }
+  .row-head { display: flex; gap: 10px; align-items: baseline; }
+  .kind {
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 1px 6px; border-radius: 4px; background: var(--bg); border: 1px solid var(--line); white-space: nowrap;
+  }
+  .time { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .err .kind, .err .title { color: var(--error); }
+  pre {
+    margin: 6px 0 0; padding: 8px 10px; overflow-x: auto;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  }
+  dl { margin: 6px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; }
+  dt { color: var(--muted); font-size: 13px; }
+  dd { margin: 0; }
+  .summary { border-left: 3px solid var(--accent); padding-left: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Mood signal agent</h1>
+    <p>When an employee reports feeling stressed, an agent looks up the employee and their manager through MCP tools and sends the manager a recommendation. Everything here is synthetic: invented people, an in-memory directory that resets on every run, and no real messages sent.</p>
+    <div id="status">Checking server...</div>
+  </header>
+
+  <section class="panel controls">
+    <div>
+      <h2><span class="num">1</span>Pick an employee</h2>
+      <select id="employee" aria-label="Employee"><option>Loading...</option></select>
+    </div>
+    <div>
+      <h2><span class="num">2</span>Click a mood</h2>
+      <div class="moods" id="moods"></div>
+      <p class="hint">Only <b>stressed</b> starts the agent. The other moods are recorded and nothing else happens.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span class="num">3</span>Watch the agent</h2>
+    <ol class="steps" id="steps">
+      <li data-step="event"><span class="num">1</span>Mood received<span class="detail"></span></li>
+      <li data-step="employee"><span class="num">2</span>Employee found<span class="detail"></span></li>
+      <li data-step="manager"><span class="num">3</span>Manager found<span class="detail"></span></li>
+      <li data-step="notify"><span class="num">4</span>Manager notified<span class="detail"></span></li>
+    </ol>
+    <ul id="trace" aria-live="polite"></ul>
+  </section>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const MOODS = ["great", "good", "okay", "low", "stressed"];
+  const $ = (id) => document.getElementById(id);
+  const employeeSelect = $("employee");
+  const moodBox = $("moods");
+  const trace = $("trace");
+  const steps = $("steps");
+  let running = false;
+
+  // --- small DOM helpers; all text goes through textContent, never innerHTML ---
+  function el(tag, attrs, children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === "text") node.textContent = v; else node.setAttribute(k, v);
+    }
+    for (const c of children || []) if (c) node.append(c);
+    return node;
+  }
+  function pre(value) {
+    return el("pre", { text: typeof value === "string" ? value : JSON.stringify(value, null, 2) });
+  }
+  function fields(pairs) {
+    const dl = el("dl");
+    for (const [k, v] of pairs) dl.append(el("dt", { text: k }), el("dd", { text: v ?? "" }));
+    return dl;
+  }
+  function time(at) {
+    const d = at ? new Date(at) : new Date();
+    return isNaN(d) ? "" : d.toLocaleTimeString();
+  }
+  function addRow(kind, title, body, opts) {
+    const li = el("li", opts && opts.error ? { class: "err" } : {}, [
+      el("div", { class: "row-head" }, [
+        el("span", { class: "kind", text: kind }),
+        el("span", { class: "title", text: title }),
+        el("span", { class: "time", text: time(opts && opts.at) }),
+      ]),
+      body,
+    ]);
+    if (opts && opts.summary) li.classList.add("summary");
+    trace.append(li);
+    li.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  // --- the four-step strip ---
+  function resetSteps() {
+    for (const li of steps.children) {
+      li.classList.remove("on", "fail");
+      li.querySelector(".detail").textContent = "";
+    }
+  }
+  function markStep(name, detail, failed) {
+    const li = steps.querySelector(`[data-step="${name}"]`);
+    if (!li) return;
+    li.classList.add(failed ? "fail" : "on");
+    li.querySelector(".detail").textContent = detail || "";
+  }
+  const STEP_FOR_TOOL = { find_employee: "employee", find_manager: "manager", notify_manager: "notify" };
+
+  // --- one renderer per trace entry kind ---
+  function render(entry) {
+    switch (entry.kind) {
+      case "event": {
+        const e = entry.event || {};
+        markStep("event", `${e.mood} from ${e.employeeId}`);
+        addRow("event", `${e.employeeId} reported "${e.mood}"`, null, { at: entry.at });
+        break;
+      }
+      case "tool_call":
+        addRow("tool_call", `Calling ${entry.name}`, pre(entry.args), { at: entry.at });
+        break;
+      case "tool_result": {
+        const step = STEP_FOR_TOOL[entry.name];
+        const r = entry.result || {};
+        if (step) markStep(step, entry.isError ? "error" : (r.name || r.subject || r.id || ""), entry.isError);
+        addRow("tool_result", `${entry.name} ${entry.isError ? "returned an error" : "returned"}`,
+          pre(entry.result), { at: entry.at, error: entry.isError });
+        break;
+      }
+      case "model": {
+        const rec = entry.recommendation || {};
+        addRow("model", `Recommendation from ${entry.model}`, fields([
+          ["Approach", rec.approach], ["First step", rec.firstStep], ["Rationale", rec.rationale],
+        ]), { at: entry.at });
+        break;
+      }
+      case "notification": {
+        const n = entry.notification || {};
+        markStep("notify", `to ${n.toEmployeeId}`);
+        addRow("notification", `Sent ${n.id} to ${n.toEmployeeId}`, fields([
+          ["Subject", n.subject], ["Body", n.body],
+        ]), { at: entry.at });
+        break;
+      }
+      case "done": {
+        const d = entry.decision || {};
+        const a = d.action || {};
+        addRow("decision", `Decision ${d.id} recorded`, fields([
+          ["Action", a.kind], ["Notification", a.notificationId],
+        ]), { at: entry.at });
+        break;
+      }
+      case "error":
+        addRow("error", entry.message || "Unknown error", null, { at: entry.at, error: true });
+        break;
+      default:
+        addRow(entry.kind || "unknown", "Unrecognised entry", pre(entry), { at: entry.at });
+    }
+  }
+
+  function renderSummary(s) {
+    const who = s.answeredBy
+      ? `${s.answeredBy} (${s.live ? "live model" : "stub model, deterministic"})`
+      : s.error
+        ? "the run failed before a model answered"
+        : "no agent ran";
+    const pairs = [["Answered by", who], ["Why", s.reason], ["Store", s.store]];
+    if (s.error) pairs.push(["Error", s.error]);
+    addRow("done", s.error ? "Run failed" : "Run finished", fields(pairs), { summary: true, error: Boolean(s.error) });
+  }
+
+  // --- SSE over a POST: fetch the stream and split it into frames ---
+  function parseFrame(frame) {
+    let event = "message";
+    const data = [];
+    for (const line of frame.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+    }
+    if (data.length === 0) return null;
+    return { event, data: JSON.parse(data.join("\n")) };
+  }
+
+  async function send(mood) {
+    if (running) return;
+    const employeeId = employeeSelect.value;
+    if (!employeeId) return;
+    running = true;
+    setDisabled(true);
+    trace.replaceChildren();
+    resetSteps();
+    try {
+      const res = await fetch("/api/event", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ employeeId, mood }),
+      });
+      if (!res.ok || !res.body) {
+        const text = await res.text();
+        addRow("error", `Server answered ${res.status}`, pre(text), { error: true });
+        return;
+      }
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buffer = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += value;
+        let cut;
+        while ((cut = buffer.indexOf("\n\n")) !== -1) {
+          const frame = parseFrame(buffer.slice(0, cut));
+          buffer = buffer.slice(cut + 2);
+          if (!frame) continue;
+          if (frame.event === "done") renderSummary(frame.data); else render(frame.data);
+        }
+      }
+    } catch (err) {
+      addRow("error", "Connection failed", pre(String(err)), { error: true });
+    } finally {
+      running = false;
+      setDisabled(false);
+      refreshHealth();
+    }
+  }
+
+  function setDisabled(on) {
+    employeeSelect.disabled = on;
+    for (const b of moodBox.querySelectorAll("button")) b.disabled = on;
+  }
+
+  // --- setup ---
+  for (const mood of MOODS) {
+    const b = el("button", { type: "button", class: mood === "stressed" ? "stressed" : "", text: mood });
+    b.addEventListener("click", () => send(mood));
+    moodBox.append(b);
+  }
+
+  async function refreshHealth() {
+    try {
+      const h = await (await fetch("/api/health")).json();
+      const status = $("status");
+      status.replaceChildren(
+        "Model: ",
+        el("b", { text: h.live ? "live (API key present)" : "stub (no API key, deterministic answers)" }),
+        h.live ? ` · live runs left this hour: ${h.remaining}; the stub answers when they run out` : "",
+      );
+    } catch {
+      $("status").textContent = "Server not reachable.";
+    }
+  }
+
+  async function loadEmployees() {
+    try {
+      const list = await (await fetch("/api/employees")).json();
+      employeeSelect.replaceChildren(...list.map((e) =>
+        el("option", { value: e.id, text: `${e.name}, ${e.role} (${e.team})` })));
+    } catch {
+      employeeSelect.replaceChildren(el("option", { text: "Could not load employees" }));
+    }
+  }
+
+  refreshHealth();
+  loadEmployees().then(() => {
+    // `#run` on the URL fires the stressed event for the first employee as soon as the
+    // page loads, so a shared link can show the four steps without a click.
+    if (location.hash === "#run" && employeeSelect.options.length > 0) send("stressed");
+  });
+})();
+</script>
+</body>
+</html>

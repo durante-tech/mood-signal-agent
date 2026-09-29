@@ -10,7 +10,7 @@
     "test": "bun test",
     "demo": "bun run src/demo.ts",
     "serve": "bun run src/server.ts",
-    "mcp": "bun run src/mcp/server.ts"
+    "mcp": "bun run src/mcp/main.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.129.0",
