@@ -1,0 +1,24 @@
+{
+  "name": "mood-signal-agent",
+  "version": "0.1.0",
+  "description": "Proof of concept: a mood-meter event triggers an agent that finds the employee and their manager through MCP tools and sends the manager a recommendation.",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "demo": "bun run src/demo.ts",
+    "serve": "bun run src/server.ts",
+    "mcp": "bun run src/mcp/server.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  }
+}
