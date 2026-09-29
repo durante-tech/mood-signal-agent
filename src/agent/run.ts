@@ -2,24 +2,27 @@
  * The agent loop. One mood event in, one Decision out, with a trace entry for
  * every step so a UI can show the work as it happens.
  *
- * The model decides; the loop sends. The model's notify_manager call is its
- * decision that the manager should be told. The loop does not execute it: it
- * answers with a "queued" result naming the manager the loop confirmed for the
+ * The loop notifies the confirmed manager exactly once after every validated
+ * recommendation, whether or not the model called notify_manager. The model's
+ * notify_manager call is acknowledged as queued and never executed: the loop
+ * answers it with a "queued" result naming the manager it confirmed for the
  * event's own employee, and ignores the subject and body the model proposed.
  * A second such call gets the same answer.
  *
- * The one notification goes out at the end of the run, and only when all of
- * this holds:
- *   - the model's final answer passes `toRecommendation`;
+ * The one notification goes out at the end of the run, after:
+ *   - the model's final answer passes `toRecommendation`, which checks its
+ *     shape: exactly the three fields, each a non-empty string;
  *   - the loop has confirmed the event's employee and their manager, with
  *     find_employee and find_manager called on `event.employeeId` (by the model
- *     or, if it did not, by the loop);
- *   - the answer's approach and first step name no other employee the run
- *     looked up.
+ *     or, if it did not, by the loop).
  * Its body is built by the loop from the approach, the first step and the
- * confirmed employee's name. If any check fails, nothing is sent and the run
- * ends in an error entry. An employee with no manager ends the run the same
- * way, as soon as the loop learns it.
+ * confirmed employee's name. If either fails, nothing is sent and the run ends
+ * in an error entry. An employee with no manager ends the run the same way, as
+ * soon as the loop learns it.
+ *
+ * The recommendation text is the model's. The loop validates its shape,
+ * confirms the recipient and sends it; it does not check what the text says
+ * about whom.
  *
  * The caller owns the MCP connection: runAgent uses it and never closes it.
  */
@@ -70,8 +73,6 @@ export async function runAgent(
   // go back to the model and are never used for the notification.
   let employee: Employee | undefined;
   let manager: Employee | undefined;
-  // Every employee record any lookup returned, by id, for the name check.
-  const seen = new Map<string, Employee>();
   // Tool errors keyed by tool name and arguments: the same failing call is not
   // repeated, while the same tool with other arguments still runs.
   const failures = new Map<string, string>();
@@ -87,7 +88,6 @@ export async function runAgent(
       return { result, isError };
     }
     const found = asEmployee(result);
-    if (found) seen.set(found.id, found);
     if (found && args.employeeId === event.employeeId) {
       if (name === "find_employee" && found.id === event.employeeId) employee = found;
       if (name === "find_manager") manager = found;
@@ -125,7 +125,7 @@ export async function runAgent(
     return confirmed;
   };
 
-  /** One model tool call: notify_manager is queued, anything else runs. */
+  /** One model tool call: notify_manager is acknowledged as queued and never executed; anything else runs. */
   const invoke = async (name: string, args: Record<string, unknown>) => {
     emit({ kind: "tool_call", at: now(), name, args });
     if (name !== "notify_manager") return lookup(name, args);
@@ -134,8 +134,9 @@ export async function runAgent(
       status: QUEUED,
       managerId: boss.id,
       message:
-        `Not sent yet. One notification to manager ${boss.id} is queued and will be sent after your final answer, ` +
-        `built from its approach and first step. The subject and body you proposed are not used. ` +
+        `Acknowledged as queued; this call is never executed. After a final answer that passes validation, ` +
+        `the system sends manager ${boss.id} exactly one notification, built from its approach and first step, ` +
+        `whether or not notify_manager was called. The subject and body you proposed are not used. ` +
         `Finish with the JSON answer.`,
     };
     emit({ kind: "tool_result", at: now(), name, result, isError: false });
@@ -172,13 +173,6 @@ export async function runAgent(
     emit({ kind: "model", at: now(), model: opts.model.name, recommendation });
 
     const { employee: who, manager: boss } = await confirm();
-    const stranger = otherEmployeeNamed(recommendation, [...seen.values()], [who, boss]);
-    if (stranger) {
-      throw new Error(
-        `the final answer names ${stranger.name} (${stranger.id}), who is not ${who.name}, the employee in this event; nothing was sent`,
-      );
-    }
-
     const notification = await send(client, boss, who, recommendation);
     emit({ kind: "notification", at: now(), notification });
 
@@ -199,7 +193,7 @@ export async function runAgent(
   }
 }
 
-/** The one send of a run: the loop's own notify_manager call, built from the checked answer. */
+/** The one send of a run: the loop's own notify_manager call, built from the validated answer. */
 async function send(client: Client, manager: Employee, employee: Employee, rec: Recommendation): Promise<Notification> {
   const args = {
     managerId: manager.id,
@@ -219,32 +213,6 @@ async function send(client: Client, manager: Employee, employee: Employee, rec: 
     throw new Error(`notify_manager returned no notification for ${manager.id}: ${describe(result)}`);
   }
   return sent;
-}
-
-/**
- * The first looked-up employee, other than `allowed`, whose full name or first
- * name appears as a whole word in the approach or first step. A first name
- * shared with an allowed person is not checked.
- */
-function otherEmployeeNamed(rec: Recommendation, seen: Employee[], allowed: Employee[]): Employee | undefined {
-  const allowedIds = new Set(allowed.map((e) => e.id));
-  const allowedNames = new Set(allowed.flatMap((e) => [e.name, firstName(e)]));
-  const text = `${rec.approach}\n${rec.firstStep}`;
-  for (const other of seen) {
-    if (allowedIds.has(other.id)) continue;
-    const names = [other.name, firstName(other)].filter((n) => n.length > 0 && !allowedNames.has(n));
-    if (names.some((n) => containsWord(text, n))) return other;
-  }
-  return undefined;
-}
-
-function firstName(e: Employee): string {
-  return e.name.trim().split(/\s+/)[0] ?? "";
-}
-
-function containsWord(text: string, word: string): boolean {
-  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "u").test(text);
 }
 
 /**

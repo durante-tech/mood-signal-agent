@@ -113,33 +113,54 @@ describe("MCP tools over an in-memory transport", () => {
     expect(store.outbox[0]!.id).toBe(n.id);
   });
 
-  test("notify_manager ids stay unique when the injected outbox has gaps", async () => {
-    // One entry numbered 3: counting entries would hand out n-2 and then n-3 again.
-    const store = seedStore();
-    store.outbox.push({ id: "n-3", toEmployeeId: "e-002", subject: "earlier", body: "earlier", sentAt: "2026-01-01T00:00:00.000Z" });
-    const conn = await connectMemory(store);
-    close = conn.close;
-    for (let i = 0; i < 2; i++) {
-      await conn.client.callTool({ name: "notify_manager", arguments: { managerId: "e-002", subject: "s", body: "b" } });
-    }
-    const ids = store.outbox.map((n) => n.id);
-    expect(ids).toEqual(["n-3", "n-4", "n-5"]);
-    expect(new Set(ids).size).toBe(ids.length);
-  });
-
-  test("notify_manager ignores outbox ids whose number is longer than 15 digits", async () => {
-    // Converted whole, the 400-digit id is Infinity and the 20-digit one loses precision.
+  test("notify_manager never issues an id already in the outbox, whatever shape those ids have", async () => {
+    // n-1, a numeric id too long for a JavaScript number, and an id that is not
+    // numeric at all. Between the first and second send another writer adds
+    // n-3, so the outbox is read at send time and not only when the server starts.
     const store = seedStore();
     const earlier = { toEmployeeId: "e-002", subject: "earlier", body: "earlier", sentAt: "2026-01-01T00:00:00.000Z" };
     store.outbox.push(
+      { id: "n-1", ...earlier },
       { id: `n-${"9".repeat(400)}`, ...earlier },
-      { id: "n-12345678901234567890", ...earlier },
-      { id: "n-2", ...earlier },
+      { id: "note-a", ...earlier },
     );
     const conn = await connectMemory(store);
     close = conn.close;
-    await conn.client.callTool({ name: "notify_manager", arguments: { managerId: "e-002", subject: "s", body: "b" } });
-    expect(store.outbox.at(-1)!.id).toBe("n-3");
+    const send = async () =>
+      read(await conn.client.callTool({ name: "notify_manager", arguments: { managerId: "e-002", subject: "s", body: "b" } }));
+
+    const issued: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const taken = new Set(store.outbox.map((n) => n.id));
+      const r = await send();
+      expect(r.isError).toBe(false);
+      const id = (r.value as { id: string }).id;
+      expect(taken.has(id)).toBe(false);
+      issued.push(id);
+      if (i === 0) store.outbox.push({ id: "n-3", ...earlier });
+    }
+    expect(issued).toEqual(["n-2", "n-4", "n-5"]);
+    const ids = store.outbox.map((n) => n.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  test("notify_manager refuses an employee nobody reports to and leaves the outbox unchanged", async () => {
+    const { client, store } = await open();
+    // e-003 is a known employee, but nobody reports to them.
+    expect([...store.employees.values()].some((e) => e.managerId === "e-003")).toBe(false);
+    const refused = read(
+      await client.callTool({ name: "notify_manager", arguments: { managerId: "e-003", subject: "x", body: "y" } }),
+    );
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("is not the manager of anyone");
+    expect(store.outbox.length).toBe(0);
+
+    // e-002 manages e-003, so the same call to them is sent.
+    const sent = read(
+      await client.callTool({ name: "notify_manager", arguments: { managerId: "e-002", subject: "x", body: "y" } }),
+    );
+    expect(sent.isError).toBe(false);
+    expect(store.outbox.map((n) => n.toEmployeeId)).toEqual(["e-002"]);
   });
 
   test("notify_manager rejects an unknown manager and sends nothing", async () => {

@@ -14,14 +14,15 @@ Read this first. It is a small demo, not a product.
 - **One scenario.** Only the `stressed` mood starts the agent. The other four moods are echoed back as an event; nothing is stored and no agent runs. An unknown employee id gets a 404 whatever the mood.
 - **The Decision seam is unfilled.** Each run produces a `Decision` with `action` filled in and `analysis` and `reflection` left as `null` on purpose (`src/types.ts`). Those are the places for the next iteration.
 - **The recommendation is not advice.** Without an API key the agent runs a deterministic stub model that builds its text from the seeded notes. With a key, a live model writes it, and its output is not reviewed by anyone before it reaches the outbox.
+- **The loop does not check what the recommendation says.** The recommendation text is the model's. The loop validates its shape, confirms the recipient and sends it, and does not check what the text says about whom. The system prompt tells the model to write only about the event's employee, and nothing enforces that.
 
 ## What it shows
 
 1. **An event arrives.** A mood-meter click: `{ employeeId, mood, at }`.
 2. **The agent finds the employee.** It calls the `find_employee` MCP tool.
 3. **The agent finds the manager.** It calls `find_manager`.
-4. **The agent decides to notify the manager.** It calls `notify_manager`. The loop queues that call instead of running it, and the agent returns its recommendation: an approach, a first step, and the rationale behind them.
-5. **The loop notifies the manager.** Once the recommendation passes its checks, the loop sends one notification to the manager it confirmed.
+4. **The agent calls `notify_manager`.** The loop acknowledges the call as queued and never executes it. The agent then returns its recommendation: an approach, a first step, and the rationale behind them.
+5. **The loop notifies the manager.** After every validated recommendation, the loop notifies the confirmed manager exactly once, whether or not the model called `notify_manager`.
 
 Every step is written to a trace. The web page streams that trace as it happens, so you can watch each tool call and its result.
 
@@ -45,7 +46,7 @@ bun run demo --employee e-003        # a specific employee
 ANTHROPIC_API_KEY=... bun run demo --live
 ```
 
-`--live` without `ANTHROPIC_API_KEY` exits with code 2 and says why. The HTTP server goes live on its own when `ANTHROPIC_API_KEY` is set in its environment. A limiter caps live agent runs at 20 per rolling hour, per process, and a run makes at most 8 model calls. Once the 20 runs are spent, the stub answers until the window frees up. The page says which model answered and why.
+`--live` without `ANTHROPIC_API_KEY` exits with code 2 and says why. The HTTP server goes live on its own when `ANTHROPIC_API_KEY` is set in its environment. A limiter caps live agent runs at 20 per rolling hour, per process. A run makes at most 8 model turns, each one request plus up to 2 SDK retries on transport errors: a failed or timed-out connection, or an API answer of 408, 409, 429 or 5xx. Once the 20 runs are spent, the stub answers until the window frees up. The page says which model answered and why.
 
 The MCP server also runs on its own over stdio, for use with any MCP client:
 
@@ -92,7 +93,9 @@ To connect real data, replace `seedStore()` with a loader for your system and ke
 
 `runAgent` (`src/agent/run.ts`) gives the model the system prompt, one user message describing the event, and the list of MCP tools. It then runs up to eight turns. On each turn the model either asks for tool calls or returns its final recommendation. Lookup calls go to the MCP server, and their results go back to the model as the next messages. When the run ends, the loop records a `Decision` pointing at the notification it sent.
 
-The model decides, and the loop sends. The model's `notify_manager` call never runs: the model gets a `queued` answer naming the manager the loop confirmed, and the subject and body it proposed are dropped. After the final answer passes its checks, the loop sends one notification to the manager of the event's own employee, looking them up itself if the model did not. The loop writes the body from the approach, the first step and the employee's name. If a check fails, nothing is sent and the run ends in an error. The checks refuse an invalid answer, an answer that names another employee the run looked up, and an employee with no manager.
+The loop notifies the confirmed manager exactly once after every validated recommendation, whether or not the model called `notify_manager`. The model's `notify_manager` call is acknowledged as queued and never executed: the model gets a `queued` answer naming the manager the loop confirmed, and the subject and body it proposed are dropped. The loop confirms the manager of the event's own employee, looking them up itself if the model did not, and writes the body from the approach, the first step and the employee's name. Nothing is sent, and the run ends in an error, when the final answer fails validation or the employee has no manager.
+
+The recommendation text is the model's. The loop validates its shape, confirms the recipient and sends it, and does not check what the text says about whom. The system prompt tells the model to write only about the event's employee, and nothing in the loop enforces that.
 
 The final answer must be exactly one JSON object with the keys `approach`, `firstStep` and `rationale` and no others, each a non-empty string. One ```` ```json ```` fence around it is allowed. Text around the object, extra keys or a cut-off object fail the run.
 

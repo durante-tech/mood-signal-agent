@@ -19,26 +19,28 @@ function fail(message: string): CallToolResult {
 }
 
 /**
- * The highest number among outbox ids of the form "n-<1 to 15 digits>". Other
- * ids are ignored. Fifteen digits stay below 2^53, so the number is exact and
- * the next id is always new; a longer suffix is never converted.
+ * True when at least one employee in the store reports to `id`. An employee
+ * nobody reports to is not a manager, so notify_manager refuses them.
  */
-function highestNotificationNumber(outbox: Notification[]): number {
-  let highest = 0;
-  for (const n of outbox) {
-    const match = /^n-(\d{1,15})$/.exec(n.id);
-    if (!match?.[1]) continue;
-    const value = Number.parseInt(match[1], 10);
-    if (value > highest) highest = value;
-  }
-  return highest;
+function isManager(store: HrStore, id: string): boolean {
+  for (const e of store.employees.values()) if (e.managerId === id) return true;
+  return false;
 }
 
 export function createServer(store: HrStore = seedStore()): McpServer {
   const server = new McpServer({ name: "mood-signal-hr", version: "0.1.0" });
-  // Continue numbering after the highest "n-<number>" id already in the outbox,
-  // so ids stay unique per store even when an injected outbox has gaps.
-  let counter = highestNotificationNumber(store.outbox);
+  // The last number this server issued. Each send reads the outbox as it is at
+  // that moment and moves on to the next number whose "n-<number>" id is not in
+  // it, so a new id never equals one already there, whatever shape the other
+  // ids have or whoever added them. Numbers only go up, so an id is never
+  // issued twice even if entries leave the outbox.
+  let counter = 0;
+  const nextId = (): string => {
+    const taken = new Set(store.outbox.map((n) => n.id));
+    do counter += 1;
+    while (taken.has(`n-${counter}`));
+    return `n-${counter}`;
+  };
 
   server.registerTool(
     "find_employee",
@@ -71,7 +73,8 @@ export function createServer(store: HrStore = seedStore()): McpServer {
   server.registerTool(
     "notify_manager",
     {
-      description: "Send a private message to a manager. Returns the notification that was recorded.",
+      description:
+        "Send a private message to a manager: an employee at least one other employee reports to. Returns the notification that was recorded.",
       inputSchema: {
         managerId: z.string().describe("Employee id of the manager to notify"),
         subject: z.string().describe("Short subject line"),
@@ -80,9 +83,9 @@ export function createServer(store: HrStore = seedStore()): McpServer {
     },
     async ({ managerId, subject, body }) => {
       if (!store.employees.has(managerId)) return fail(`No employee with id "${managerId}".`);
-      counter += 1;
+      if (!isManager(store, managerId)) return fail(`Employee "${managerId}" is not the manager of anyone.`);
       const notification: Notification = {
-        id: `n-${counter}`,
+        id: nextId(),
         toEmployeeId: managerId,
         subject,
         body,

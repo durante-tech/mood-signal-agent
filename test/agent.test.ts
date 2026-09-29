@@ -88,7 +88,7 @@ const find = (employeeId: string) => [
 const notify = (managerId: string, body = "b") => ({ name: "notify_manager", args: { managerId, subject: "s", body } });
 
 describe("runAgent with the stub model", () => {
-  test("finds the employee and the manager, queues the model's notify, then sends one notification", async () => {
+  test("finds the employee and the manager; the model's notify_manager call is queued, never executed, and the loop sends one notification", async () => {
     const store = seedStore();
     const connection = await connectMemory(store);
     const event: MoodEvent = { employeeId: "e-003", mood: "stressed", at: AT };
@@ -125,7 +125,7 @@ describe("runAgent with the stub model", () => {
     }
   });
 
-  test("notifies the manager when the model finishes without calling notify_manager", async () => {
+  test("the loop sends the notification regardless: one to the confirmed manager when the model finishes without calling notify_manager", async () => {
     const model = scripted([find("e-003")]);
     const { store, trace, result } = await run(model, "e-003");
 
@@ -151,8 +151,8 @@ describe("runAgent with the stub model", () => {
   });
 });
 
-describe("the loop, not the model, sends the notification", () => {
-  test("it is sent exactly once and only after the final answer, even when the model calls notify_manager early and twice", async () => {
+describe("the loop notifies the confirmed manager exactly once after every validated answer; the model's notify_manager call is only queued", () => {
+  test("sent exactly once and only after the final answer, even when the model calls notify_manager early and twice", async () => {
     const model = scripted([
       [notify("e-006")], // before any lookup, and addressed to the wrong manager
       find("e-003"),
@@ -173,6 +173,9 @@ describe("the loop, not the model, sends the notification", () => {
     const second = resultFor(last, "t3-0")!;
     expect(first.isError).toBe(false);
     expect(JSON.parse(first.content)).toMatchObject({ status: "queued", managerId: "e-002" });
+    const told = JSON.parse(first.content).message as string;
+    expect(told).toContain("never executed");
+    expect(told).toContain("whether or not notify_manager was called");
     expect(second.content).toBe(first.content);
     expect(second.isError).toBe(false);
   });
@@ -210,15 +213,19 @@ describe("the loop, not the model, sends the notification", () => {
     }
   });
 
-  test("an approach written about another employee the run looked up never reaches the manager", async () => {
-    const aboutHannah: Recommendation = { ...REC, approach: "Offer Hannah a short one-to-one today." };
+  test("the loop does not check what the text says: an approach about another employee the run looked up is still sent to the confirmed manager", async () => {
+    // The text is the model's. The loop validates its shape, confirms the
+    // recipient and sends it; it does not check whom the text is about.
+    const aboutHannah: Recommendation = { ...REC, approach: "Offer Hannah Weber a short one-to-one today." };
     const model = scripted([[{ name: "find_employee", args: { employeeId: "e-007" } }], find("e-003"), [notify("e-002")]], aboutHannah);
-    const { store, trace, error } = await run(model, "e-003");
+    const { store, trace, result, error } = await run(model, "e-003");
 
-    expect(error?.message).toMatch(/names Hannah Weber \(e-007\), who is not Priya Raman/);
-    expect(store.outbox.length).toBe(0);
-    expect(kinds(trace)).not.toContain("notification");
-    expect(trace.at(-1)!.kind).toBe("error");
+    expect(error).toBeUndefined();
+    expect(store.outbox.map((n) => n.toEmployeeId)).toEqual(["e-002"]);
+    expect(store.outbox[0]!.subject).toBe("Check in with Priya Raman");
+    expect(store.outbox[0]!.body).toContain(aboutHannah.approach);
+    expect(kinds(trace).slice(-3)).toEqual(["model", "notification", "done"]);
+    expect(result!.decision.action.notificationId).toBe(store.outbox[0]!.id);
   });
 
   test("a model that chased another employee: the event's employee's manager gets a body naming the event's employee", async () => {
@@ -281,8 +288,24 @@ describe("the loop, not the model, sends the notification", () => {
 });
 
 describe("the system prompt", () => {
-  test("tells the model the notify call is queued and the final answer is one exact JSON object", () => {
-    expect(SYSTEM_PROMPT).toContain("queued");
+  test("tells the model its notify call is queued and never executed, and the loop sends exactly once regardless", () => {
+    expect(SYSTEM_PROMPT).toContain("The call is acknowledged as queued and never executed.");
+    expect(SYSTEM_PROMPT).toContain(
+      "After every final answer that passes validation, the system notifies the confirmed manager of the employee in the event exactly once, whether or not you called notify_manager.",
+    );
+    expect(SYSTEM_PROMPT).not.toMatch(/decid/i);
+    expect(SYSTEM_PROMPT).not.toContain("should be told");
+  });
+
+  test("states that the text is not checked, and still asks for text only about the event's employee", () => {
+    expect(SYSTEM_PROMPT).toContain(
+      "the system validates the answer's shape (below), confirms the recipient and sends it, and does not check what the text says about whom.",
+    );
+    expect(SYSTEM_PROMPT).toContain("Write the approach and first step only about the employee in the event");
+    expect(SYSTEM_PROMPT).not.toMatch(/names someone else/);
+  });
+
+  test("tells the model the final answer is one exact JSON object", () => {
     expect(SYSTEM_PROMPT).toContain("The subject and body you pass to notify_manager are not used.");
     expect(SYSTEM_PROMPT).toContain("The final answer must be exactly one JSON object and nothing else");
     expect(SYSTEM_PROMPT).toContain("No text before or after it, no other keys");

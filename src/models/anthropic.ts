@@ -10,6 +10,10 @@
  * and the results that follow match one to one, which is the normal case;
  * otherwise the turn is rebuilt from the recorded calls. Extended thinking is
  * off, so a rebuilt turn, which carries only tool_use blocks, is a valid turn.
+ *
+ * Each turn is one request. The client retries it at most `MAX_RETRIES` times
+ * when the connection fails or times out or the API answers 408, 409, 429 or
+ * 5xx, so one turn sends at most 1 + `MAX_RETRIES` requests.
  */
 import Anthropic from "@anthropic-ai/sdk";
 import { parseRecommendation } from "../recommendation.ts";
@@ -18,6 +22,9 @@ import type { Model, ModelMessage, ModelTurn, ToolSpec } from "../types.ts";
 export { parseRecommendation };
 
 export const LIVE_MODEL_ID = "claude-sonnet-5-5";
+
+/** Retries per turn on transport errors. Set here so the SDK default cannot change it. */
+const MAX_RETRIES = 2;
 
 export class AnthropicModel implements Model {
   readonly name: string;
@@ -33,15 +40,19 @@ export class AnthropicModel implements Model {
   constructor(apiKey: string, opts: { model?: string; maxTokens?: number } = {}) {
     this.name = opts.model ?? LIVE_MODEL_ID;
     this.maxTokens = opts.maxTokens ?? 600;
-    this.client = new Anthropic({ apiKey });
+    this.client = new Anthropic({ apiKey, maxRetries: MAX_RETRIES });
   }
 
   async turn(input: { system: string; messages: ModelMessage[]; tools: ToolSpec[] }): Promise<ModelTurn> {
+    const messages = this.toApiMessages(input.messages);
+    if (messages.length === 0) {
+      throw new Error("nothing to send to the model: the conversation needs at least one user message");
+    }
     const response = await this.client.messages.create({
       model: this.name,
       max_tokens: this.maxTokens,
       system: input.system,
-      messages: this.toApiMessages(input.messages),
+      messages,
       tools: input.tools.map(toApiTool),
       tool_choice: { type: "auto" },
     });

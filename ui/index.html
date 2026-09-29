@@ -102,7 +102,7 @@
   <section class="panel controls">
     <div>
       <h2><span class="num">1</span>Pick an employee</h2>
-      <select id="employee" aria-label="Employee"><option>Loading...</option></select>
+      <select id="employee" aria-label="Employee"><option value="">Loading...</option></select>
     </div>
     <div>
       <h2><span class="num">2</span>Click a mood</h2>
@@ -133,6 +133,11 @@
   const trace = $("trace");
   const steps = $("steps");
   let running = false;
+  // The employeeId of the event this page sent, and the arguments of the most
+  // recent call to each tool in the stream, so a lookup result can be matched
+  // to the call that produced it.
+  let eventEmployeeId = "";
+  let lastArgs = {};
 
   // --- small DOM helpers; all text goes through textContent, never innerHTML ---
   function el(tag, attrs, children) {
@@ -183,9 +188,15 @@
     li.classList.add(failed ? "fail" : "on");
     li.querySelector(".detail").textContent = detail || "";
   }
-  // Only the lookups mark a step from a tool result. "Manager notified" turns
-  // green on the loop's notification entry and on nothing else.
+  // Only the lookups mark a step from a tool result, and only a lookup whose
+  // call named the event's own employee: a lookup of anyone else leaves the
+  // tile as it is. "Manager notified" turns green on the loop's notification
+  // entry and on nothing else.
   const STEP_FOR_TOOL = { find_employee: "employee", find_manager: "manager" };
+  function isLookupOfEventEmployee(entry) {
+    const args = lastArgs[entry.name] || {};
+    return eventEmployeeId !== "" && args.employeeId === eventEmployeeId;
+  }
   function isQueued(entry) {
     return entry.name === "notify_manager" && !entry.isError && (entry.result || {}).status === "queued";
   }
@@ -208,6 +219,7 @@
         break;
       }
       case "tool_call":
+        lastArgs[entry.name] = entry.args || {};
         addRow("tool_call", entry.name === "notify_manager"
           ? "The model asks to notify the manager"
           : `Calling ${entry.name}`, pre(entry.args), { at: entry.at });
@@ -221,7 +233,9 @@
           break;
         }
         const step = STEP_FOR_TOOL[entry.name];
-        if (step) markStep(step, entry.isError ? "error" : (r.name || r.id || ""), entry.isError);
+        if (step && isLookupOfEventEmployee(entry)) {
+          markStep(step, entry.isError ? "error" : (r.name || r.id || ""), entry.isError);
+        }
         addRow("tool_result", `${entry.name} ${entry.isError ? "returned an error" : "returned"}`,
           pre(entry.result), { at: entry.at, error: entry.isError });
         break;
@@ -289,6 +303,8 @@
     const employeeId = employeeSelect.value;
     if (!employeeId) return;
     running = true;
+    eventEmployeeId = employeeId;
+    lastArgs = {};
     setDisabled(true);
     trace.replaceChildren();
     resetSteps();
@@ -358,7 +374,8 @@
       employeeSelect.replaceChildren(...list.map((e) =>
         el("option", { value: e.id, text: `${e.name}, ${e.role} (${e.team})` })));
     } catch {
-      employeeSelect.replaceChildren(el("option", { text: "Could not load employees" }));
+      // An empty value: send() ignores it and "#run" does not fire.
+      employeeSelect.replaceChildren(el("option", { value: "", text: "Could not load employees" }));
     }
   }
 
@@ -366,7 +383,9 @@
   loadEmployees().then(() => {
     // `#run` on the URL fires the stressed event for the first employee as soon as the
     // page loads, so a shared link can show the four steps without a click.
-    if (location.hash === "#run" && employeeSelect.options.length > 0) send("stressed");
+    // It fires only when the first option carries an employee id; a failed load has none.
+    const first = employeeSelect.options[0];
+    if (location.hash === "#run" && first && first.value !== "") send("stressed");
   });
 })();
 </script>

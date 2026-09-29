@@ -8,7 +8,7 @@ import type { MoodEvent, TraceEntry } from "../src/types.ts";
 // A localhost stand-in for the Messages API: each test scripts the responses,
 // one per request. No test here reaches the network.
 
-type Reply = { content: unknown[]; stop_reason: string };
+type Reply = { content: unknown[]; stop_reason: string } | { status: number };
 type Sent = { model: string; messages: Array<{ role: string; content: unknown }>; thinking?: unknown };
 let script: Reply[] = [];
 /** Every request body the stand-in received, oldest first. */
@@ -23,6 +23,13 @@ beforeAll(() => {
       requests.push(body);
       const next = script.shift();
       if (!next) return new Response("no scripted reply left", { status: 500 });
+      if ("status" in next) {
+        // retry-after-ms keeps the SDK's wait between retries at 1 ms.
+        return Response.json(
+          { type: "error", error: { type: "api_error", message: "scripted failure" } },
+          { status: next.status, headers: { "retry-after-ms": "1" } },
+        );
+      }
       return Response.json({
         id: "msg_test", type: "message", role: "assistant", model: body.model,
         content: next.content, stop_reason: next.stop_reason, stop_sequence: null, stop_details: null,
@@ -83,6 +90,44 @@ describe("AnthropicModel final answers", () => {
     }];
     const turn = await model().turn({ system: "s", messages: [{ role: "user", content: "u" }], tools: [] });
     expect(turn).toEqual({ kind: "final", recommendation: { approach: "Check in today.", firstStep: "Message them.", rationale: "On call." } });
+  });
+});
+
+describe("AnthropicModel requests", () => {
+  const FINAL_TEXT = JSON.stringify({ approach: "a", firstStep: "b", rationale: "c" });
+  const final = (): Reply => ({ stop_reason: "end_turn", content: [{ type: "text", text: FINAL_TEXT, citations: null }] });
+
+  test("a turn with no user message throws a clear error and sends no request", async () => {
+    requests = [];
+    script = [final()];
+    const m = model();
+    await expect(m.turn({ system: "s", messages: [], tools: [] })).rejects.toThrow(
+      "nothing to send to the model: the conversation needs at least one user message",
+    );
+    await expect(m.turn({ system: "s", messages: [{ role: "assistant", content: "calls" }], tools: [] })).rejects.toThrow(
+      /needs at least one user message/,
+    );
+    expect(requests.length).toBe(0);
+    expect(script.length).toBe(1);
+  });
+
+  test("a turn sends one request plus at most 2 retries on a server error, then fails", async () => {
+    requests = [];
+    script = [{ status: 500 }, { status: 500 }, { status: 500 }, final()];
+    await expect(model().turn({ system: "s", messages: [{ role: "user", content: "u" }], tools: [] })).rejects.toThrow(
+      /500/,
+    );
+    expect(requests.length).toBe(3);
+    // The fourth reply was never asked for.
+    expect(script.length).toBe(1);
+  });
+
+  test("a turn that succeeds on its second retry returns the answer after 3 requests", async () => {
+    requests = [];
+    script = [{ status: 503 }, { status: 429 }, final()];
+    const turn = await model().turn({ system: "s", messages: [{ role: "user", content: "u" }], tools: [] });
+    expect(turn).toEqual({ kind: "final", recommendation: { approach: "a", firstStep: "b", rationale: "c" } });
+    expect(requests.length).toBe(3);
   });
 });
 

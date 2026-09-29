@@ -1,7 +1,8 @@
 /**
  * The contract for the model's final answer. The live model's text goes
- * through `parseRecommendation`; the agent loop checks every answer, from any
- * model, with `toRecommendation` before anything is sent.
+ * through `parseRecommendation`; the agent loop validates the shape of every
+ * answer, from any model, with `toRecommendation` before anything is sent.
+ * Only the shape is checked, never what the text says.
  */
 import type { Recommendation } from "./types.ts";
 
@@ -17,7 +18,7 @@ const FENCE = /^```json\s*([\s\S]*?)\s*```$/;
  * Reads the model's final text. After trimming and removing one optional
  * ```json fence, the whole text must be one JSON object with exactly the three
  * fields. Prose around the object, extra keys, a second object or a fragment
- * all throw, because a manager should never receive text nobody checked.
+ * all throw, because only an answer of exactly this shape is ever sent.
  */
 export function parseRecommendation(text: string): Recommendation {
   const trimmed = text.trim();
