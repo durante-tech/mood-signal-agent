@@ -113,6 +113,20 @@ describe("MCP tools over an in-memory transport", () => {
     expect(store.outbox[0]!.id).toBe(n.id);
   });
 
+  test("notify_manager ids stay unique when the injected outbox has gaps", async () => {
+    // One entry numbered 3: counting entries would hand out n-2 and then n-3 again.
+    const store = seedStore();
+    store.outbox.push({ id: "n-3", toEmployeeId: "e-002", subject: "earlier", body: "earlier", sentAt: "2026-01-01T00:00:00.000Z" });
+    const conn = await connectMemory(store);
+    close = conn.close;
+    for (let i = 0; i < 2; i++) {
+      await conn.client.callTool({ name: "notify_manager", arguments: { managerId: "e-002", subject: "s", body: "b" } });
+    }
+    const ids = store.outbox.map((n) => n.id);
+    expect(ids).toEqual(["n-3", "n-4", "n-5"]);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
   test("notify_manager rejects an unknown manager and sends nothing", async () => {
     const { client, store } = await open();
     const r = read(

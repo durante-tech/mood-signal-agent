@@ -107,7 +107,7 @@
     <div>
       <h2><span class="num">2</span>Click a mood</h2>
       <div class="moods" id="moods"></div>
-      <p class="hint">Only <b>stressed</b> starts the agent. The other moods are recorded and nothing else happens.</p>
+      <p class="hint">Only <b>stressed</b> starts the agent. The other moods are echoed back as an event; nothing is stored.</p>
     </div>
   </section>
 
@@ -179,6 +179,8 @@
   function markStep(name, detail, failed) {
     const li = steps.querySelector(`[data-step="${name}"]`);
     if (!li) return;
+    // The latest result wins: a refused notify followed by a sent one reads as sent.
+    li.classList.remove("on", "fail");
     li.classList.add(failed ? "fail" : "on");
     li.querySelector(".detail").textContent = detail || "";
   }
@@ -236,8 +238,11 @@
   }
 
   function renderSummary(s) {
+    const kind = s.live ? "live model" : "stub model, deterministic";
     const who = s.answeredBy
-      ? `${s.answeredBy} (${s.live ? "live model" : "stub model, deterministic"})`
+      ? s.error
+        ? `${s.answeredBy} answered, then the run failed (${kind})`
+        : `${s.answeredBy} (${kind})`
       : s.error
         ? "the run failed before a model answered"
         : "no agent ran";

@@ -2,6 +2,13 @@
  * The agent loop. One mood event in, one Decision out, with a trace entry for
  * every step so a UI can show the work as it happens.
  *
+ * The loop, not the model, decides whether a notification goes out. A
+ * notify_manager call runs only when it is addressed to the manager that
+ * find_manager returned for the event's own employee, and only once per run.
+ * Any other notify_manager call is refused with an error result the model can
+ * read, and nothing is sent. If the model finishes without a notification, the
+ * loop looks up the event's employee and manager itself and sends one.
+ *
  * The caller owns the MCP connection: runAgent uses it and never closes it.
  */
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -38,23 +45,60 @@ export async function runAgent(
   };
   const { client } = opts.connection;
 
-  // What the tools have told us so far; the fallback notification needs it.
-  const seen: { employee?: Employee; manager?: Employee; notification?: Notification } = {};
+  // What the loop has confirmed about the event's own employee. Lookups of
+  // anyone else go back to the model but are never used for the notification.
+  let employee: Employee | undefined;
+  let manager: Employee | undefined;
+  // The one notification this run sent. It is the only id a Decision may carry.
+  let notification: Notification | undefined;
+  // Tool errors keyed by tool name and arguments: the same failing call is not
+  // repeated, while the same tool with other arguments still runs.
   const failures = new Map<string, string>();
 
-  /** Calls one tool, records the trace, and remembers what it learned. */
+  /** Why a notify_manager call must not run, or undefined when it may. */
+  const refusal = (args: Record<string, unknown>): string | undefined => {
+    if (notification) {
+      return `Not sent: already notified, ${notification.id}. A run sends one notification.`;
+    }
+    if (!manager || args.managerId !== manager.id) {
+      return (
+        `Not sent: the recipient must be the manager of employee ${event.employeeId}. ` +
+        `Call find_manager with employeeId "${event.employeeId}" first and address notify_manager to the id it returns.`
+      );
+    }
+    return undefined;
+  };
+
+  /** Calls one tool, records the trace, and remembers what it confirmed. */
   const invoke = async (name: string, args: Record<string, unknown>) => {
     emit({ kind: "tool_call", at: now(), name, args });
+    const refused = name === "notify_manager" ? refusal(args) : undefined;
+    if (refused) {
+      const result = { error: refused };
+      emit({ kind: "tool_result", at: now(), name, result, isError: true });
+      return { result: result as unknown, isError: true };
+    }
+
     const { result, isError } = await callTool(client, name, args);
     emit({ kind: "tool_result", at: now(), name, result, isError });
-    if (isError) failures.set(name, describe(result));
-    else {
-      if (name === "find_employee") seen.employee = result as Employee;
-      if (name === "find_manager") seen.manager = result as Employee;
-      if (name === "notify_manager") {
-        seen.notification = result as Notification;
-        emit({ kind: "notification", at: now(), notification: seen.notification });
-      }
+    if (isError) {
+      failures.set(callKey(name, args), describe(result));
+      return { result, isError };
+    }
+
+    const forEvent = args.employeeId === event.employeeId;
+    if (name === "find_employee" && forEvent) {
+      const found = asEmployee(result);
+      if (found?.id === event.employeeId) employee = found;
+    }
+    if (name === "find_manager" && forEvent) manager = asEmployee(result) ?? manager;
+    if (name === "notify_manager") {
+      const sent = asNotification(result);
+      // The tool says it sent something; without an id there is nothing to
+      // record, and sending again could reach the manager twice.
+      if (!sent) throw new Error(`notify_manager reported success but returned no notification: ${describe(result)}`);
+      notification = sent;
+      emit({ kind: "notification", at: now(), notification: sent });
     }
     return { result, isError };
   };
@@ -81,17 +125,21 @@ export async function runAgent(
     }
     if (!recommendation) throw new Error(`the model did not finish within ${MAX_TURNS} turns`);
 
-    // The manager is always notified: if the model never did it, the agent does.
-    if (!seen.notification) {
-      const need = async (name: string): Promise<Employee> => {
-        const known = failures.get(name);
-        if (known) throw new Error(`${name} failed for ${event.employeeId}: ${known}`);
-        const { result, isError } = await invoke(name, { employeeId: event.employeeId });
+    // The manager is always notified: if the model did not do it, the loop
+    // does, using the event's own employee id and never anyone the model chose.
+    if (!notification) {
+      const need = async (name: "find_employee" | "find_manager"): Promise<Employee> => {
+        const args = { employeeId: event.employeeId };
+        const known = failures.get(callKey(name, args));
+        if (known !== undefined) throw new Error(`${name} failed for ${event.employeeId}: ${known}`);
+        const { result, isError } = await invoke(name, args);
         if (isError) throw new Error(`${name} failed for ${event.employeeId}: ${describe(result)}`);
-        return result as Employee;
+        const found = name === "find_employee" ? employee : manager;
+        if (!found) throw new Error(`${name} returned no employee record for ${event.employeeId}: ${describe(result)}`);
+        return found;
       };
-      const who = seen.employee ?? (await need("find_employee"));
-      const boss = seen.manager ?? (await need("find_manager"));
+      const who = employee ?? (await need("find_employee"));
+      const boss = manager ?? (await need("find_manager"));
       const sent = await invoke("notify_manager", {
         managerId: boss.id,
         subject: `Check in with ${who.name}`,
@@ -99,7 +147,6 @@ export async function runAgent(
       });
       if (sent.isError) throw new Error(`notify_manager failed: ${describe(sent.result)}`);
     }
-    const notification = seen.notification;
     if (!notification) throw new Error("notify_manager returned no notification");
 
     const decision: Decision = {
@@ -143,6 +190,38 @@ async function callTool(
   } catch (err) {
     return { result: { error: err instanceof Error ? err.message : String(err) }, isError: true };
   }
+}
+
+/** One key per tool and argument set, independent of key order. */
+function callKey(name: string, args: Record<string, unknown>): string {
+  return `${name} ${canonical(args)}`;
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (isRecord(value)) {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
+function asEmployee(value: unknown): Employee | undefined {
+  if (isRecord(value) && typeof value.id === "string" && typeof value.name === "string") {
+    return value as unknown as Employee;
+  }
+  return undefined;
+}
+
+function asNotification(value: unknown): Notification | undefined {
+  if (isRecord(value) && typeof value.id === "string" && typeof value.toEmployeeId === "string") {
+    return value as unknown as Notification;
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function describe(result: unknown): string {

@@ -107,6 +107,39 @@ describe("HTTP server", () => {
     }
   });
 
+  test("GET /api/employees leaves the top of the tree out of the picker", async () => {
+    const list = (await (await fetch(`${base}/api/employees`)).json()) as Array<{ id: string }>;
+    const ids = list.map((e) => e.id);
+    expect(ids).toContain("e-003");
+    expect(ids).not.toContain("e-001");
+  });
+
+  test("POST /api/event with an unknown employee is a 404 for a mood that runs no agent", async () => {
+    const res = await fetch(`${base}/api/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ employeeId: "e-999", mood: "good" }),
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'unknown employeeId "e-999"' });
+  });
+
+  test("POST /api/event that fails after the model answered names the model in the summary", async () => {
+    // e-001 has no manager: the stub answers, then the loop cannot find anyone to notify.
+    const res = await fetch(`${base}/api/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ employeeId: "e-001", mood: "stressed" }),
+    });
+    expect(res.status).toBe(200);
+    const blocks = parseSse(await res.text());
+    expect(traceEntries(blocks).some((e) => e.kind === "model")).toBe(true);
+    const last = blocks.at(-1)!;
+    expect(isDone(last)).toBe(true);
+    expect(last.data).toMatchObject({ answeredBy: "stub", live: false });
+    expect((last.data as { error?: string }).error).toMatch(/find_manager failed for e-001/);
+  }, 15_000);
+
   test("GET / serves the page", async () => {
     const res = await fetch(`${base}/`);
     expect(res.status).toBe(200);

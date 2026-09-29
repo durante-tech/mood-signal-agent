@@ -10,7 +10,7 @@ Read this first. It is a small demo, not a product.
 - **No auth.** Anyone who can reach the HTTP server can send an event for any employee and read the trace.
 - **No persistence.** Nothing is saved. The HTTP server builds a fresh in-memory store for every request, so the outbox is empty again on the next click.
 - **No real delivery.** "Notify the manager" appends to an in-memory outbox. No email, chat message or push is sent.
-- **One scenario.** Only the `stressed` mood starts the agent. The other four moods are recorded as an event and nothing else happens.
+- **One scenario.** Only the `stressed` mood starts the agent. The other four moods are echoed back as an event; nothing is stored and no agent runs. An unknown employee id gets a 404 whatever the mood.
 - **The Decision seam is unfilled.** Each run produces a `Decision` with `action` filled in and `analysis` and `reflection` left as `null` on purpose (`src/types.ts`). Those are the places for the next iteration.
 - **The recommendation is not advice.** Without an API key the agent runs a deterministic stub model that builds its text from the seeded notes. With a key, a live model writes it, and its output is not reviewed by anyone before it reaches the outbox.
 
@@ -43,7 +43,7 @@ bun run demo --employee e-003        # a specific employee
 ANTHROPIC_API_KEY=... bun run demo --live
 ```
 
-`--live` without `ANTHROPIC_API_KEY` exits with code 2 and says why. The HTTP server goes live on its own when `ANTHROPIC_API_KEY` is set in its environment, and falls back to the stub after 20 live runs in a rolling hour. The page says which model answered and why.
+`--live` without `ANTHROPIC_API_KEY` exits with code 2 and says why. The HTTP server goes live on its own when `ANTHROPIC_API_KEY` is set in its environment. A limiter caps live agent runs at 20 per rolling hour, per process, and a run makes at most 8 model calls. Once the 20 runs are spent, the stub answers until the window frees up. The page says which model answered and why.
 
 The MCP server also runs on its own over stdio, for use with any MCP client:
 
@@ -89,7 +89,11 @@ To connect real data, replace `seedStore()` with a loader for your system and ke
 
 `runAgent` (`src/agent/run.ts`) gives the model the system prompt, one user message describing the event, and the list of MCP tools. It then runs up to eight turns. On each turn the model either asks for tool calls or returns its final recommendation. Tool calls go to the MCP server, and their results go back to the model as the next messages. When the model finishes, the loop records a `Decision` pointing at the notification that was sent.
 
-If the model finishes without calling `notify_manager`, the loop sends the notification itself, using the recommendation's approach as the body, so the manager is always told. The trace shows when that happens.
+The loop, not the model, decides whether a notification goes out. A `notify_manager` call runs only when it is addressed to the manager that `find_manager` returned for the event's own employee, and only once per run. Any other `notify_manager` call is not executed: the model gets an error result saying why, and nothing is sent.
+
+If the model finishes without a notification, the loop looks up the event's employee and manager itself, by the event's employee id, and sends the notification with the recommendation's approach as the body, so the manager is always told. The trace shows when that happens.
+
+The live model's final answer must be a JSON object with non-empty `approach`, `firstStep` and `rationale` strings. Anything else fails the run instead of reaching a manager.
 
 The loop does not know which model it holds. The stub and the live model implement the same `Model` interface (`src/types.ts`), which is how the tests run the whole path with no key.
 

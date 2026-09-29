@@ -6,7 +6,9 @@
  * to answer a `tool_use` block from the assistant turn right before it, so the
  * class remembers the assistant content it received for every tool-calling
  * turn and sends it back unchanged (thinking blocks included), keyed by the
- * tool_use ids. That keeps the history append-only.
+ * tool_use ids. That keeps the history append-only. A recorded turn is only
+ * replayed when its tool_use blocks and the results that follow match one to
+ * one; otherwise the turn is rebuilt from the recorded calls.
  */
 import Anthropic from "@anthropic-ai/sdk";
 import type { Model, ModelMessage, ModelTurn, Recommendation, ToolSpec } from "../types.ts";
@@ -85,8 +87,12 @@ export class AnthropicModel implements Model {
     let results: Anthropic.ToolResultBlockParam[] = [];
     let currentTurn: number | undefined;
 
+    // Sends the assistant turn that asked for the gathered results, then the results.
     const flush = () => {
-      if (results.length > 0) out.push({ role: "user", content: results });
+      if (results.length > 0) {
+        const { assistant, answers } = this.pairTurn(currentTurn, results);
+        out.push({ role: "assistant", content: assistant }, { role: "user", content: answers });
+      }
       results = [];
       currentTurn = undefined;
     };
@@ -96,11 +102,8 @@ export class AnthropicModel implements Model {
         const id = m.toolCallId;
         if (!id) throw new Error("a tool_result message has no toolCallId");
         const turn = this.turnOf.get(id);
-        if (results.length === 0 || turn !== currentTurn) {
-          flush();
-          out.push({ role: "assistant", content: this.assistantContent(id, turn) });
-          currentTurn = turn;
-        }
+        if (results.length > 0 && turn !== currentTurn) flush();
+        currentTurn = turn;
         results.push({ type: "tool_result", tool_use_id: id, content: m.content, is_error: m.isError ?? false });
       } else if (m.role === "user") {
         flush();
@@ -113,13 +116,45 @@ export class AnthropicModel implements Model {
     return out;
   }
 
-  private assistantContent(id: string, turn: number | undefined): Anthropic.ContentBlockParam[] {
+  /**
+   * The assistant turn to send before `results`, and the results to send after
+   * it. The recorded turn goes back unchanged when every tool_use in it has
+   * exactly one result here and no result answers anything else. When that
+   * does not hold, the turn is rebuilt from the recorded calls: one tool_use
+   * per answered id, each answered once, so the API never sees an unanswered
+   * or doubly answered tool_use. A rebuilt turn carries no text or thinking
+   * blocks.
+   */
+  private pairTurn(
+    turn: number | undefined,
+    results: Anthropic.ToolResultBlockParam[],
+  ): { assistant: Anthropic.ContentBlockParam[]; answers: Anthropic.ToolResultBlockParam[] } {
     const recorded = turn === undefined ? undefined : this.turns[turn];
-    if (recorded) return recorded;
-    const call = this.calls.get(id);
-    if (!call) throw new Error(`no tool call recorded for tool_use id ${id}`);
-    return [{ type: "tool_use", id, name: call.name, input: call.args }];
+    if (recorded && answersEachOnce(recorded, results)) return { assistant: recorded, answers: results };
+
+    const answers: Anthropic.ToolResultBlockParam[] = [];
+    const ids = new Set<string>();
+    for (const r of results) {
+      if (ids.has(r.tool_use_id)) continue;
+      ids.add(r.tool_use_id);
+      answers.push(r);
+    }
+    const assistant = answers.map((r): Anthropic.ContentBlockParam => {
+      const call = this.calls.get(r.tool_use_id);
+      if (!call) throw new Error(`no tool call recorded for tool_use id ${r.tool_use_id}`);
+      return { type: "tool_use", id: r.tool_use_id, name: call.name, input: call.args };
+    });
+    return { assistant, answers };
   }
+}
+
+/** True when the tool_use ids in `content` and the result ids match one to one. */
+function answersEachOnce(content: Anthropic.ContentBlockParam[], results: Anthropic.ToolResultBlockParam[]): boolean {
+  const asked = content.flatMap((b) => (b.type === "tool_use" ? [b.id] : []));
+  const answered = results.map((r) => r.tool_use_id);
+  if (asked.length !== answered.length || new Set(answered).size !== answered.length) return false;
+  const askedIds = new Set(asked);
+  return answered.every((id) => askedIds.has(id));
 }
 
 function toApiTool(spec: ToolSpec): Anthropic.Tool {
@@ -133,37 +168,61 @@ function toApiTool(spec: ToolSpec): Anthropic.Tool {
 }
 
 /**
- * Reads {approach, firstStep, rationale} from the final text, fenced or not.
- * Well-formed prose with no JSON becomes the approach. Text that starts like a
- * JSON object but does not parse into the three fields is an error, because
- * sending it to a manager would send them a fragment.
+ * Reads {approach, firstStep, rationale} from the model's final text. The
+ * object may stand alone, sit in a fenced block, or be surrounded by prose:
+ * every balanced {...} in the text is tried in order, and the first one that
+ * parses with all three fields as non-empty strings is the answer. Anything
+ * else is an error, because a manager should never receive prose nobody
+ * checked or half of a JSON object.
  */
 export function parseRecommendation(text: string): Recommendation {
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(text);
-  const candidate = fenced?.[1] ?? text;
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
-  if (start !== -1 && end > start) {
-    try {
-      const value: unknown = JSON.parse(candidate.slice(start, end + 1));
-      if (
-        isRecord(value) &&
-        typeof value.approach === "string" &&
-        typeof value.firstStep === "string" &&
-        typeof value.rationale === "string"
-      ) {
-        return { approach: value.approach, firstStep: value.firstStep, rationale: value.rationale };
-      }
-    } catch {
-      // fall through to the checks below
+  let sawObject = false;
+  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
+    const end = closingBrace(text, start);
+    if (end === -1) continue;
+    const value = parseJson(text.slice(start, end + 1));
+    if (!isRecord(value)) continue;
+    sawObject = true;
+    const { approach, firstStep, rationale } = value;
+    if (isFilled(approach) && isFilled(firstStep) && isFilled(rationale)) return { approach, firstStep, rationale };
+  }
+  const found = sawObject ? "no JSON object in it had all three" : "no complete JSON object was found in it";
+  throw new Error(
+    `the model's final answer must be a JSON object with non-empty "approach", "firstStep" and "rationale" strings; ${found}`,
+  );
+}
+
+/** Index of the brace that closes the one at `start`, skipping braces inside strings; -1 if none. */
+function closingBrace(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (c === "\\") i += 1;
+      else if (c === '"') inString = false;
+    } else if (c === '"') {
+      inString = true;
+    } else if (c === "{") {
+      depth += 1;
+    } else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
     }
   }
-  // An unclosed fence (a cut-off answer) never matches the regex above, so strip
-  // an opening fence before looking at the first character.
-  if (candidate.replace(/^\s*```(?:json)?\s*/, "").startsWith("{")) {
-    throw new Error("the model's final answer looked like JSON but was not a complete {approach, firstStep, rationale} object");
+  return -1;
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
   }
-  return { approach: text, firstStep: "see approach", rationale: "see approach" };
+}
+
+function isFilled(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

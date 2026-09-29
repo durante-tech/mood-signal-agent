@@ -18,10 +18,20 @@ function fail(message: string): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
 }
 
+function highestNotificationNumber(outbox: Notification[]): number {
+  let highest = 0;
+  for (const n of outbox) {
+    const match = /^n-(\d+)$/.exec(n.id);
+    if (match) highest = Math.max(highest, Number(match[1]));
+  }
+  return highest;
+}
+
 export function createServer(store: HrStore = seedStore()): McpServer {
   const server = new McpServer({ name: "mood-signal-hr", version: "0.1.0" });
-  // Continue numbering after anything already in the outbox, so ids stay unique per store.
-  let counter = store.outbox.length;
+  // Continue numbering after the highest "n-<number>" id already in the outbox,
+  // so ids stay unique per store even when an injected outbox has gaps.
+  let counter = highestNotificationNumber(store.outbox);
 
   server.registerTool(
     "find_employee",

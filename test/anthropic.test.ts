@@ -9,14 +9,18 @@ import type { MoodEvent, TraceEntry } from "../src/types.ts";
 // one per request. No test here reaches the network.
 
 type Reply = { content: unknown[]; stop_reason: string };
+type Sent = { model: string; messages: Array<{ role: string; content: unknown }> };
 let script: Reply[] = [];
+/** Every request body the stand-in received, oldest first. */
+let requests: Sent[] = [];
 let server: ReturnType<typeof Bun.serve>;
 
 beforeAll(() => {
   server = Bun.serve({
     port: 0,
     async fetch(req) {
-      const body = (await req.json()) as { model: string };
+      const body = (await req.json()) as Sent;
+      requests.push(body);
       const next = script.shift();
       if (!next) return new Response("no scripted reply left", { status: 500 });
       return Response.json({
@@ -51,7 +55,7 @@ describe("AnthropicModel final answers", () => {
       .rejects.toThrow(/ran out of tokens \(max_tokens 600\)/);
   });
 
-  test("a run whose final answer is cut off notifies nobody and ends in an error entry", async () => {
+  test("a final answer cut off by max_tokens fails the run before the loop's fallback sends anything", async () => {
     const store = seedStore();
     const employee = [...store.employees.values()].find((e) => e.managerId !== null)!;
     const event: MoodEvent = { employeeId: employee.id, mood: "stressed", at: "2026-01-15T09:00:00.000Z" };
@@ -83,21 +87,73 @@ describe("AnthropicModel final answers", () => {
 });
 
 describe("parseRecommendation", () => {
-  test("well-formed prose becomes the approach", () => {
-    expect(parseRecommendation("Offer a private check-in today.")).toEqual({
-      approach: "Offer a private check-in today.", firstStep: "see approach", rationale: "see approach",
+  const REJECTED = /must be a JSON object with non-empty "approach", "firstStep" and "rationale" strings/;
+  const WANT = { approach: "Check in today.", firstStep: "Message them.", rationale: "On call." };
+  const OBJECT = JSON.stringify(WANT);
+
+  test("prose with no JSON object is rejected", () => {
+    expect(() => parseRecommendation("Offer a private check-in today.")).toThrow(REJECTED);
+  });
+
+  test("a JSON fragment is rejected, bare, after prose, or inside an unclosed fence", () => {
+    expect(() => parseRecommendation(FRAGMENT)).toThrow(REJECTED);
+    expect(() => parseRecommendation("Here is my answer: " + FRAGMENT)).toThrow(REJECTED);
+    expect(() => parseRecommendation("```json\n" + FRAGMENT)).toThrow(REJECTED);
+  });
+
+  test("an object missing a field or carrying an empty one is rejected", () => {
+    expect(() => parseRecommendation('{"approach":"Check in."}')).toThrow(REJECTED);
+    expect(() => parseRecommendation('Answer: {"approach":"Check in.","firstStep":"x"} done.')).toThrow(REJECTED);
+    expect(() => parseRecommendation('{"approach":"","firstStep":"x","rationale":"y"}')).toThrow(REJECTED);
+    expect(() => parseRecommendation('{"approach":"a","firstStep":"  ","rationale":"y"}')).toThrow(REJECTED);
+  });
+
+  test("an object embedded in prose is found, even after other braces", () => {
+    expect(parseRecommendation(`I weighed {a few options}. Here it is:\n${OBJECT}\nHope that helps.`)).toEqual(WANT);
+    expect(parseRecommendation(`Sure.\n\`\`\`json\n${OBJECT}\n\`\`\``)).toEqual(WANT);
+  });
+
+  test("a brace inside a string value does not end the object", () => {
+    const text = '{"approach":"Use the {team} channel.","firstStep":"Ask \\"how are you?\\"","rationale":"On call."}';
+    expect(parseRecommendation(text)).toEqual({
+      approach: "Use the {team} channel.", firstStep: 'Ask "how are you?"', rationale: "On call.",
     });
   });
+});
 
-  test("a JSON fragment is an error", () => {
-    expect(() => parseRecommendation(FRAGMENT)).toThrow(/looked like JSON/);
-  });
+describe("AnthropicModel history replay", () => {
+  const FINAL: Reply = { stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ approach: "a", firstStep: "b", rationale: "c" }), citations: null }] };
+  const RECORDED = [
+    { type: "text", text: "Looking both up.", citations: null },
+    { type: "tool_use", id: "toolu_a", name: "find_employee", input: { employeeId: "e-003" } },
+    { type: "tool_use", id: "toolu_b", name: "find_manager", input: { employeeId: "e-003" } },
+  ];
+  const user = { role: "user" as const, content: "u" };
+  const marker = { role: "assistant" as const, content: "calls" };
+  const result = (id: string) => ({ role: "tool_result" as const, content: "{}", toolCallId: id, isError: false });
+  const ids = (content: unknown) => (content as Array<{ id?: string; tool_use_id?: string }>).map((b) => b.id ?? b.tool_use_id);
 
-  test("a JSON fragment inside an unclosed fence is an error", () => {
-    expect(() => parseRecommendation("```json\n" + FRAGMENT)).toThrow(/looked like JSON/);
-  });
+  test("a recorded turn is replayed only when each tool_use has exactly one result; otherwise it is rebuilt", async () => {
+    requests = [];
+    script = [{ stop_reason: "tool_use", content: RECORDED }, FINAL, FINAL, FINAL];
+    const m = model();
+    await m.turn({ system: "s", messages: [user], tools: [] });
 
-  test("a complete object missing a field is an error", () => {
-    expect(() => parseRecommendation('{"approach":"Check in."}')).toThrow(/looked like JSON/);
+    // Both calls answered once: the recorded turn goes back as it came, text block included.
+    await m.turn({ system: "s", messages: [user, marker, result("toolu_a"), result("toolu_b")], tools: [] });
+    expect(requests[1]!.messages[1]).toEqual({ role: "assistant", content: RECORDED });
+
+    // One call unanswered: the turn is rebuilt so every tool_use sent has its result.
+    await m.turn({ system: "s", messages: [user, marker, result("toolu_a")], tools: [] });
+    expect(requests[2]!.messages[1]).toEqual({
+      role: "assistant",
+      content: [{ type: "tool_use", id: "toolu_a", name: "find_employee", input: { employeeId: "e-003" } }],
+    });
+    expect(ids(requests[2]!.messages[2]!.content)).toEqual(["toolu_a"]);
+
+    // One call answered twice: rebuilt, and the repeated result is sent once.
+    await m.turn({ system: "s", messages: [user, marker, result("toolu_a"), result("toolu_a"), result("toolu_b")], tools: [] });
+    expect(ids(requests[3]!.messages[1]!.content)).toEqual(["toolu_a", "toolu_b"]);
+    expect(ids(requests[3]!.messages[2]!.content)).toEqual(["toolu_a", "toolu_b"]);
   });
 });

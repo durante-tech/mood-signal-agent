@@ -9,7 +9,8 @@
  *   GET  /api/health    { ok, live, remaining }
  *   GET  /api/employees the seeded employees who have a manager (id, name, role, team)
  *   POST /api/event     { employeeId, mood } -> text/event-stream of TraceEntry,
- *                       then a named "done" event with { answeredBy, live, reason, store }
+ *                       then a named "done" event with { answeredBy, live, reason, store };
+ *                       404 for an unknown employeeId, whatever the mood
  */
 import { join } from "node:path";
 import { runAgent } from "./agent/run.ts";
@@ -110,6 +111,12 @@ async function handleEvent(req: Request, opts: Required<HandlerOptions>): Promis
 
   const event: MoodEvent = { ...parsed, at: new Date().toISOString() };
 
+  // Every mood names an employee, so an unknown one is a 404 whatever the mood.
+  const store = seedStore();
+  if (!store.employees.has(event.employeeId)) {
+    return json({ error: `unknown employeeId "${event.employeeId}"` }, 404);
+  }
+
   if (event.mood !== "stressed") {
     return sseStream(async (send) => {
       const entry: TraceEntry = { kind: "event", at: event.at, event };
@@ -124,21 +131,23 @@ async function handleEvent(req: Request, opts: Required<HandlerOptions>): Promis
     });
   }
 
-  const connection = await connectMemory();
-  if (!connection.store.employees.has(event.employeeId)) {
-    await connection.close();
-    return json({ error: `unknown employeeId "${event.employeeId}"` }, 404);
-  }
+  const connection = await connectMemory(store);
 
   // Picked only for stressed events, so other moods never spend the live budget.
   const picked = pickModel(opts.env, opts.limiter);
 
   return sseStream(async (send) => {
+    // Set once the model has returned its final answer, so a failure after that
+    // point still says which model answered.
+    let modelAnswered = false;
     try {
       const result = await runAgent(event, {
         model: picked.model,
         connection,
-        onTrace: (entry) => send(entry),
+        onTrace: (entry) => {
+          if (entry.kind === "model") modelAnswered = true;
+          send(entry);
+        },
       });
       const done: DoneSummary = {
         answeredBy: result.answeredBy,
@@ -150,7 +159,7 @@ async function handleEvent(req: Request, opts: Required<HandlerOptions>): Promis
     } catch (err) {
       // runAgent has already emitted an "error" trace entry; the summary repeats it.
       const done: DoneSummary = {
-        answeredBy: null,
+        answeredBy: modelAnswered ? picked.model.name : null,
         live: picked.live,
         reason: picked.reason,
         store: STORE_NOTE,
